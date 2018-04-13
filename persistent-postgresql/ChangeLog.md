@@ -1,3 +1,43 @@
+## 2.8.2
+
+Added module `Database.Persist.Postgres.JSON` [#793](https://github.com/yesodweb/persistent/pull/793)
+
+* `PersistField` and `PersistFieldSql` instances for `Data.Aeson.Value`
+* Filter operators `(@>.)` and `(<@.)` to filter on JSON values
+
+## 2.8.1.1
+
+* Added a more detailed error message when a `numeric` column's scale and precision can't be parsed. [#781](https://github.com/yesodweb/persistent/pull/781)
+
+## 2.8.1
+
+* Implemented `connPutManySql` to utilize batched `putMany`. [#770](https://github.com/yesodweb/persistent/pull/770)
+
+## 2.8.0
+
+* Switch from `MonadBaseControl` to `MonadUnliftIO`
+
+## 2.6.3
+
+* Added new function `migrateEnableExtension`, to enable Postgres extensions in migrations.
+
+## 2.6.2.2
+
+* Because `text` and `varchar` are synonyms in Postgresql, don't attempt to migrate between them. [#762](https://github.com/yesodweb/persistent/pull/762)
+
+## 2.6.2.1
+
+* Fix bug where, if a custom column width was set, the field would be migrated every time [#742](https://github.com/yesodweb/persistent/pull/742)
+
+## 2.6.2
+
+* Expose new functions: `withPostgresqlPoolWithVersion`, `withPostgresqlConnWithVersion` and `createPostgresqlPoolModifiedWithVersion`.
+
+## 2.6.1
+
+* Match changes in persistent
+* Clean up warnings
+
 ## 2.6
 
 * Atomic upsert support for postgreSQL backend

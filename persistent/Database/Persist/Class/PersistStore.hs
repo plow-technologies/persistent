@@ -12,21 +12,27 @@ module Database.Persist.Class.PersistStore
     , PersistStoreWrite (..)
     , getEntity
     , getJust
+    , getJustEntity
     , belongsTo
     , belongsToJust
     , insertEntity
+    , insertRecord
     , ToBackendKey(..)
+    , BackendCompatible(..)
     ) where
 
 import qualified Data.Text as T
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Exception.Lifted (throwIO)
+import Control.Exception (throwIO)
 import Control.Monad.Trans.Reader (ReaderT)
 import Control.Monad.Reader (MonadReader (ask), runReaderT)
 import Database.Persist.Class.PersistEntity
 import Database.Persist.Class.PersistField
 import Database.Persist.Types
 import qualified Data.Aeson as A
+import qualified Data.Map as Map
+import Data.Map (Map)
+import qualified Data.Maybe as Maybe
 
 -- | Class which allows the plucking of a @BaseBackend backend@ from some larger type.
 -- For example,
@@ -45,6 +51,50 @@ class (HasPersistBackend backend) => IsPersistBackend backend where
     -- It should be used carefully and only when actually constructing a @backend@. Careless use allows us
     -- to accidentally run a write query against a read-only database.
     mkPersistBackend :: BaseBackend backend -> backend
+
+-- | This class witnesses that two backend are compatible, and that you can
+-- convert from the @sub@ backend into the @sup@ backend. This is similar
+-- to the 'HasPersistBackend' and 'IsPersistBackend' classes, but where you
+-- don't want to fix the type associated with the 'PersistEntityBackend' of
+-- a record.
+--
+-- Generally speaking, where you might have:
+--
+-- @
+-- foo ::
+--   ( 'PersistEntity' record
+--   , 'PeristEntityBackend' record ~ 'BaseBackend' backend
+--   , 'IsSqlBackend' backend
+--   )
+-- @
+--
+-- this can be replaced with:
+--
+-- @
+-- foo ::
+--   ( 'PersistEntity' record,
+--   , 'PersistEntityBackend' record ~ backend
+--   , 'BackendCompatible' 'SqlBackend' backend
+--   )
+-- @
+--
+-- This works for 'SqlReadBackend' because of the @instance 'BackendCompatible' 'SqlBackend' 'SqlReadBackend'@, without needing to go through the 'BaseBackend' type family.
+--
+-- Likewise, functions that are currently hardcoded to use 'SqlBackend' can be generalized:
+--
+-- @
+-- -- before:
+-- asdf :: 'ReaderT' 'SqlBackend' m ()
+-- asdf = pure ()
+--
+-- -- after:
+-- asdf' :: 'BackendCompatible' SqlBackend backend => ReaderT backend m ()
+-- asdf' = withReaderT 'projectBackend' asdf
+-- @
+--
+-- @since 2.7.1
+class BackendCompatible sup sub where
+    projectBackend :: sub -> sup
 
 -- | A convenient alias for common type signatures
 type PersistRecordBackend record backend = (PersistEntity record, PersistEntityBackend record ~ BaseBackend backend)
@@ -84,6 +134,19 @@ class
     -- | Get a record by identifier, if available.
     get :: (MonadIO m, PersistRecordBackend record backend)
         => Key record -> ReaderT backend m (Maybe record)
+
+    -- | Get many records by their respective identifiers, if available.
+    --
+    -- @since 2.8.1
+    getMany
+        :: (MonadIO m, PersistRecordBackend record backend)
+        => [Key record] -> ReaderT backend m (Map (Key record) record)
+    getMany [] = return Map.empty
+    getMany ks = do
+        vs <- mapM get ks
+        let kvs   = zip ks vs
+        let kvs'  = (fmap Maybe.fromJust) `fmap` filter (\(_,v) -> Maybe.isJust v) kvs
+        return $ Map.fromList kvs'
 
 class
   ( Show (BackendKey backend), Read (BackendKey backend)
@@ -128,10 +191,8 @@ class
     -- Useful when migrating data from one entity to another
     -- and want to preserve ids.
     --
-    -- The MongoDB backend inserts all the entities in one database query.
-    --
-    -- The SQL backends use the slow, default implementation of
-    -- @mapM_ insertKey@.
+    -- The MongoDB, PostgreSQL, SQLite and MySQL backends insert all records in
+    -- one database query.
     insertEntityMany :: (MonadIO m, PersistRecordBackend record backend)
                      => [Entity record] -> ReaderT backend m ()
     insertEntityMany = mapM_ (\(Entity k record) -> insertKey k record)
@@ -145,6 +206,21 @@ class
     -- exist then a new record will be inserted.
     repsert :: (MonadIO m, PersistRecordBackend record backend)
             => Key record -> record -> ReaderT backend m ()
+
+    -- | Put many entities into the database.
+    --
+    -- Batch version of 'repsert' for SQL backends.
+    --
+    -- Useful when migrating data from one entity to another
+    -- and want to preserve ids.
+    --
+    -- Differs from @insertEntityMany@ by gracefully skipping
+    -- pre-existing records matching key(s).
+    -- @since 2.8.1
+    repsertMany
+        :: (MonadIO m, PersistRecordBackend record backend)
+        => [(Key record, record)] -> ReaderT backend m ()
+    repsertMany = mapM_ (uncurry repsert)
 
     -- | Replace the record in the database with the given
     -- key. Note that the result is undefined if such record does
@@ -174,7 +250,7 @@ class
         get key >>= maybe (liftIO $ throwIO $ KeyNotFound $ show key) return
 
 
--- | Same as get, but for a non-null (not Maybe) foreign key
+-- | Same as 'get', but for a non-null (not Maybe) foreign key.
 -- Unsafe unless your database is enforcing that the foreign key is valid.
 getJust :: ( PersistStoreRead backend
            , Show (Key record)
@@ -184,6 +260,23 @@ getJust :: ( PersistStoreRead backend
 getJust key = get key >>= maybe
   (liftIO $ throwIO $ PersistForeignConstraintUnmet $ T.pack $ show key)
   return
+
+-- | Same as 'getJust', but returns an 'Entity' instead of just the record.
+--
+-- @since 2.6.1
+getJustEntity
+  :: (PersistEntityBackend record ~ BaseBackend backend
+     ,MonadIO m
+     ,PersistEntity record
+     ,PersistStoreRead backend)
+  => Key record -> ReaderT backend m (Entity record)
+getJustEntity key = do
+  record <- getJust key
+  return $
+    Entity
+    { entityKey = key
+    , entityVal = record
+    }
 
 -- | Curry this to make a convenience function that loads an associated model.
 --
@@ -220,10 +313,23 @@ insertEntity e = do
 
 -- | Like @get@, but returns the complete @Entity@.
 getEntity ::
-    ( PersistStoreWrite backend
+    ( PersistStoreRead backend
     , PersistRecordBackend e backend
     , MonadIO m
     ) => Key e -> ReaderT backend m (Maybe (Entity e))
 getEntity key = do
     maybeModel <- get key
     return $ fmap (key `Entity`) maybeModel
+
+-- | Like 'insertEntity' but just returns the record instead of 'Entity'.
+--
+-- @since 2.6.1
+insertRecord
+  :: (PersistEntityBackend record ~ BaseBackend backend
+     ,PersistEntity record
+     ,MonadIO m
+     ,PersistStoreWrite backend)
+  => record -> ReaderT backend m record
+insertRecord record = do
+  insert_ record
+  return $ record

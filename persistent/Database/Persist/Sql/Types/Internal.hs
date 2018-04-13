@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -28,7 +29,7 @@ import Control.Monad.Logger (LogSource, LogLevel)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Reader (ReaderT, runReaderT, ask)
 import Data.Acquire (Acquire)
-import Data.Conduit (Source)
+import Data.Conduit (ConduitM)
 import Data.Int (Int64)
 import Data.IORef (IORef)
 import Data.Map (Map)
@@ -39,6 +40,7 @@ import Database.Persist.Class
   , PersistQueryRead, PersistQueryWrite
   , PersistStoreRead, PersistStoreWrite
   , PersistUniqueRead, PersistUniqueWrite
+  , BackendCompatible(..)
   )
 import Database.Persist.Class.PersistStore (IsPersistBackend (..))
 import Database.Persist.Types
@@ -57,7 +59,7 @@ data Statement = Statement
     , stmtExecute :: [PersistValue] -> IO Int64
     , stmtQuery :: forall m. MonadIO m
                 => [PersistValue]
-                -> Acquire (Source m [PersistValue])
+                -> Acquire (ConduitM () [PersistValue] m ())
     }
 
 data SqlBackend = SqlBackend
@@ -66,6 +68,31 @@ data SqlBackend = SqlBackend
     , connInsertSql :: EntityDef -> [PersistValue] -> InsertSqlResult
     , connInsertManySql :: Maybe (EntityDef -> [[PersistValue]] -> InsertSqlResult) -- ^ SQL for inserting many rows and returning their primary keys, for backends that support this functioanlity. If 'Nothing', rows will be inserted one-at-a-time using 'connInsertSql'.
     , connUpsertSql :: Maybe (EntityDef -> Text -> Text)
+    -- ^ Some databases support performing UPSERT _and_ RETURN entity
+    -- in a single call.
+    --
+    -- This field when set will be used to generate the UPSERT+RETURN sql given
+    -- * an entity definition
+    -- * updates to be run on unique key(s) collision
+    --
+    -- When left as 'Nothing', we find the unique key from entity def before
+    -- * trying to fetch an entity by said key
+    -- * perform an update when result found, else issue an insert
+    -- * return new entity from db
+    --
+    -- @since 2.6
+    , connPutManySql :: Maybe (EntityDef -> Int -> Text)
+    -- ^ Some databases support performing bulk UPSERT, specifically
+    -- "insert or replace many records" in a single call.
+    --
+    -- This field when set, given
+    -- * an entity definition
+    -- * number of records to be inserted
+    -- should produce a PUT MANY sql with placeholders for records
+    --
+    -- When left as 'Nothing', we default to using 'defaultPutMany'.
+    --
+    -- @since 2.8.1
     , connStmtMap :: IORef (Map Text Statement)
     , connClose :: IO ()
     , connMigrateSql
@@ -81,6 +108,11 @@ data SqlBackend = SqlBackend
     , connRDBMS :: Text
     , connLimitOffset :: (Int,Int) -> Bool -> Text -> Text
     , connLogFunc :: LogFunc
+    , connMaxParams :: Maybe Int
+    -- ^ Some databases (probably only Sqlite) have a limit on how
+    -- many question-mark parameters may be used in a statement
+    --
+    -- @since 2.6.1
     }
     deriving Typeable
 instance HasPersistBackend SqlBackend where
@@ -125,7 +157,7 @@ readToUnknown ma = do
 
 -- | A constraint synonym which witnesses that a backend is SQL and can run read queries.
 type SqlBackendCanRead backend =
-  ( IsSqlBackend backend
+  ( BackendCompatible SqlBackend backend
   , PersistQueryRead backend, PersistStoreRead backend, PersistUniqueRead backend
   )
 -- | A constraint synonym which witnesses that a backend is SQL and can run read and write queries.

@@ -8,13 +8,14 @@ module Database.Persist.Class
     , PersistStore
     , PersistStoreRead (..)
     , PersistStoreWrite (..)
-    , BaseBackend(..)
     , PersistRecordBackend
     , getJust
+    , getJustEntity
     , getEntity
     , belongsTo
     , belongsToJust
     , insertEntity
+    , insertRecord
 
     -- * PersistUnique
     , PersistUnique
@@ -22,6 +23,7 @@ module Database.Persist.Class
     , PersistUniqueWrite (..)
     , getByValue
     , insertBy
+    , insertUniqueEntity
     , replaceUnique
     , checkUnique
     , onlyUnique
@@ -51,6 +53,7 @@ module Database.Persist.Class
     , HasPersistBackend (..)
     , IsPersistBackend ()
     , liftPersist
+    , BackendCompatible (..)
 
     -- * JSON utilities
     , keyValueEntityToJSON, keyValueEntityFromJSON

@@ -1,5 +1,5 @@
 name:            persistent-redis
-version:         2.5.2
+version:         2.5.2.2
 license:         BSD3
 license-file:    LICENSE
 author:          Pavel Ryzhov <paul@paulrz.cz>
@@ -23,7 +23,7 @@ library
                    , persistent            >= 2.5      && < 3.0
                    , text                  >= 1.2.0.0
                    , aeson                 >= 0.8
-                   , time                  >= 1.4      && < 1.7
+                   , time                  >= 1.4
                    , attoparsec            >= 0.12.0.0
                    , mtl                   >= 2.2.0    && < 2.3
                    , transformers          >= 0.4.0.0  && < 0.6.0.0
@@ -59,7 +59,7 @@ test-suite  basic
                    , text                  >= 1.2.0.0
                    , aeson                 >= 0.8
                    , binary                >= 0.7      && < 0.9
-                   , time                  >= 1.4      && < 1.7
+                   , time                  >= 1.4
                    , attoparsec            >= 0.12.0.0
                    , template-haskell
                    , monad-control         >= 0.3.2.0  && < 1.2.0.0
@@ -67,3 +67,11 @@ test-suite  basic
                    , scientific
                    , http-api-data
                    , persistent-redis
+
+    other-modules:   Database.Persist.Redis
+                     Database.Persist.Redis.Config
+                     Database.Persist.Redis.Internal
+                     Database.Persist.Redis.Store
+                     Database.Persist.Redis.Parser
+                     Database.Persist.Redis.Update
+                     Database.Persist.Redis.Exception

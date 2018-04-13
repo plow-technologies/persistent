@@ -1,3 +1,58 @@
+## 2.8.1.2
+
+* Add flag to enable full-text search extensions (enabled by default)
+* Add flag to enable URI filename support (enabled by default)
+* Add flag to enable using usleep (enabled by default)
+  - Enabling usleep allows sqlite to use a finer granularity when sleeping (reduces time between locks)
+* Add flag to enable json1 extension (enabled by default)
+
+## 2.8.1.1
+
+* Update the vendored SQLite C library from 3.19.3 to 3.22.0. See [the SQLite changelog](https://sqlite.org/changes.html) for details.
+
+## 2.8.1
+
+* Updated `SqlBackend` definition to set `connPutManySql`. [#770](https://github.com/yesodweb/persistent/pull/770)
+
+## 2.8.0
+
+* Switch from `MonadBaseControl` to `MonadUnliftIO`
+
+## 2.6.4
+
+* Adds a new function `stepConn`, which uses an additional parameter to give more detailed error messages [#750](https://github.com/yesodweb/persistent/pull/750)
+* Restores the previous function signature of `step`, which was accidentally changed in 2.6.3.2
+
+## 2.6.3.2
+
+* This release accidentally broke API, and is deprecated on Hackage.
+* Provide more detailed error messages when using the `step` function [#730](https://github.com/yesodweb/persistent/pull/730)
+
+## 2.6.3.1
+
+* Fix migration to avoid creating foreign-key constraints in temporary tables [#736](https://github.com/yesodweb/persistent/pull/736)
+
+## 2.6.3
+
+* Add 'use-pkgconfig' flag to use pkg-config to find system SQLite library.
+
+## 2.6.2.1
+
+* Update the vendored SQLite C library from 3.12.1 to 3.19.3. See [the SQLite changelog](https://sqlite.org/changes.html) for details.
+
+## 2.6.2
+
+* Turned on foreign key constraints [#646](https://github.com/yesodweb/persistent/issues/646)
+* Added new `SqliteConnectionInfo`-based API
+
+## 2.6.1
+
+* Added functions to monitor (status) and control (softHeapLimit) process-wide SQLite memory usage.
+
+## 2.6.0.1
+
+* Ensure connection is closed if wrapConnectionWal fails
+
 ## 2.6
 
 Compatibility for backend-specific upsert functionality.

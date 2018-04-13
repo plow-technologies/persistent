@@ -23,7 +23,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Control.Arrow ((&&&))
 import qualified Data.Map as M
-import Data.List (foldl')
+import Data.List (find, foldl')
 import Data.Monoid (mappend)
 import Control.Monad (msum, mplus)
 
@@ -49,7 +49,7 @@ parseFieldType t0 =
       let (a, b) = T.break (== end) t
       in case parseApplyFT a of
           PSSuccess ft t' -> case (T.dropWhile isSpace t', T.uncons b) of
-              ("", Just (c, t'')) | c == end -> PSSuccess (ftMod ft) (t'' `mappend` t')
+              ("", Just (c, t'')) | c == end -> PSSuccess (ftMod ft) (t'' `Data.Monoid.mappend` t')
               (x, y) -> PSFail $ show (b, x, y)
           x -> PSFail $ show x
 
@@ -74,20 +74,20 @@ parseFieldType t0 =
             PSSuccess x t' -> goMany (front . (x:)) t'
             PSFail err -> PSFail err
             PSDone -> PSSuccess (front []) t
-            -- _ -> 
+            -- _ ->
 
 data PersistSettings = PersistSettings
     { psToDBName :: !(Text -> Text)
     , psStrictFields :: !Bool
     -- ^ Whether fields are by default strict. Default value: @True@.
     --
-    -- Since 1.2
+    -- @since 1.2
     , psIdName :: !Text
     -- ^ The name of the id column. Default value: @id@
     -- The name of the id column can also be changed on a per-model basis
     -- <https://github.com/yesodweb/persistent/wiki/Persistent-entity-syntax>
     --
-    -- Since 2.0
+    -- @since 2.0
     }
 
 defaultPersistSettings, upperCaseSettings, lowerCaseSettings :: PersistSettings
@@ -321,12 +321,12 @@ mkEntityDef ps name entattribs lines =
     attribPrefix = flip lookupKeyVal entattribs
     idName | Just _ <- attribPrefix "id" = error "id= is deprecated, ad a field named 'Id' and use sql="
            | otherwise = Nothing
-            
-    (idField, primaryComposite, uniqs, foreigns) = foldl' (\(mid, mp, us, fs) attr -> 
-        let (i, p, u, f) = takeConstraint ps name' cols attr 
+
+    (idField, primaryComposite, uniqs, foreigns) = foldl' (\(mid, mp, us, fs) attr ->
+        let (i, p, u, f) = takeConstraint ps name' cols attr
             squish xs m = xs `mappend` maybeToList m
         in (just1 mid i, just1 mp p, squish us u, squish fs f)) (Nothing, Nothing, [],[]) attribs
-                                    
+
     derives = concat $ mapMaybe takeDerives attribs
 
     cols :: [FieldDef]
@@ -343,7 +343,7 @@ just1 :: (Show x) => Maybe x -> Maybe x -> Maybe x
 just1 (Just x) (Just y) = error $ "expected only one of: "
   `mappend` show x `mappend` " " `mappend` show y
 just1 x y = x `mplus` y
-                
+
 
 mkAutoIdField :: PersistSettings -> HaskellName -> Maybe DBName -> SqlType -> FieldDef
 mkAutoIdField ps entName idName idSqlType = FieldDef
@@ -412,9 +412,9 @@ takeConstraint :: PersistSettings
           -> [FieldDef]
           -> [Text]
           -> (Maybe FieldDef, Maybe CompositeDef, Maybe UniqueDef, Maybe UnboundForeignDef)
-takeConstraint ps tableName defs (n:rest) | not (T.null n) && isUpper (T.head n) = takeConstraint' 
+takeConstraint ps tableName defs (n:rest) | not (T.null n) && isUpper (T.head n) = takeConstraint'
     where
-      takeConstraint' 
+      takeConstraint'
             | n == "Unique"  = (Nothing, Nothing, Just $ takeUniq ps tableName defs rest, Nothing)
             | n == "Foreign" = (Nothing, Nothing, Nothing, Just $ takeForeign ps tableName defs rest)
             | n == "Primary" = (Nothing, Just $ takeComposite defs rest, Nothing, Nothing)
@@ -444,7 +444,7 @@ takeId ps tableName (n:rest) = fromMaybe (error "takeId: impossible!") $ setFiel
     setIdName = ["sql=" `mappend` psIdName ps]
 takeId _ tableName _ = error $ "empty Id field for " `mappend` show tableName
 
-    
+
 takeComposite :: [FieldDef]
               -> [Text]
               -> CompositeDef
@@ -462,26 +462,56 @@ takeComposite fields pkcols
                 else d
         | otherwise = getDef ds t
 
--- Unique UppercaseConstraintName list of lowercasefields    
+-- Unique UppercaseConstraintName list of lowercasefields terminated
+-- by ! or sql= such that a unique constraint can look like:
+-- `UniqueTestNull fieldA fieldB sql=ConstraintNameInDatabase !force`
+-- Here using sql= sets the name of the constraint.
 takeUniq :: PersistSettings
-          -> Text
-          -> [FieldDef]
-          -> [Text]
-          -> UniqueDef
+         -> Text
+         -> [FieldDef]
+         -> [Text]
+         -> UniqueDef
 takeUniq ps tableName defs (n:rest)
     | not (T.null n) && isUpper (T.head n)
         = UniqueDef
             (HaskellName n)
-            (DBName $ psToDBName ps (tableName `T.append` n))
+            dbName
             (map (HaskellName &&& getDBName defs) fields)
             attrs
   where
-    (fields,attrs) = break ("!" `T.isPrefixOf`) rest
-    getDBName [] t = error $ "Unknown column in unique constraint: " ++ show t
+    isAttr a =
+      "!" `T.isPrefixOf` a
+    isSqlName a =
+      "sql=" `T.isPrefixOf` a
+    isNonField a =
+       isAttr a
+      || isSqlName a
+    (fields, nonFields) =
+      break isNonField rest
+    attrs = filter isAttr nonFields
+    usualDbName =
+      DBName $ psToDBName ps (tableName `T.append` n)
+    sqlName :: Maybe DBName
+    sqlName =
+      case find isSqlName nonFields of
+        Nothing ->
+          Nothing
+        (Just t) ->
+          case drop 1 $ T.splitOn "=" t of
+            (x : _) -> Just (DBName x)
+            _ -> Nothing
+    dbName = fromMaybe usualDbName sqlName
+    getDBName [] t =
+      error $ "Unknown column in unique constraint: " ++ show t
+              ++ " " ++ show defs ++ show n ++ " " ++ show attrs
     getDBName (d:ds) t
         | fieldHaskell d == HaskellName t = fieldDB d
         | otherwise = getDBName ds t
-takeUniq _ tableName _ xs = error $ "invalid unique constraint on table[" ++ show tableName ++ "] expecting an uppercase constraint name xs=" ++ show xs
+takeUniq _ tableName _ xs =
+  error $ "invalid unique constraint on table["
+          ++ show tableName
+          ++ "] expecting an uppercase constraint name xs="
+          ++ show xs
 
 data UnboundForeignDef = UnboundForeignDef
                          { _unboundFields :: [Text] -- ^ fields in other entity
