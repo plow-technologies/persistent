@@ -1,4 +1,14 @@
-{-# LANGUAGE QuasiQuotes, TemplateHaskell, CPP, GADTs, TypeFamilies, OverloadedStrings, FlexibleContexts, EmptyDataDecls, FlexibleInstances, GeneralizedNewtypeDeriving, MultiParamTypeClasses #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE EmptyDataDecls #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 module PersistUniqueTest where
 
 import Init
@@ -36,4 +46,9 @@ specs = describe "custom primary key" $ do
     Just vk <- get k
     Just vu <- getBy (UniqueBar b)
     vu @== Entity k vk
+  it "insertUniqueEntity" $ db $ do
+    let fo = Fo 3 5
+    Just (Entity _ insertedFoValue) <- insertUniqueEntity fo
+    Nothing <- insertUniqueEntity fo
+    fo @== insertedFoValue
 #endif

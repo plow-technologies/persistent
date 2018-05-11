@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -13,9 +14,12 @@
 -- | A postgresql backend for persistent.
 module Database.Persist.Postgresql
     ( withPostgresqlPool
+    , withPostgresqlPoolWithVersion
     , withPostgresqlConn
+    , withPostgresqlConnWithVersion
     , createPostgresqlPool
     , createPostgresqlPoolModified
+    , createPostgresqlPoolModifiedWithVersion
     , module Database.Persist.Sql
     , ConnectionString
     , PostgresConf (..)
@@ -23,15 +27,15 @@ module Database.Persist.Postgresql
     , tableName
     , fieldName
     , mockMigration
+    , migrateEnableExtension
     ) where
 
 import Database.Persist.Sql
-import Database.Persist.Sql.Util (dbIdColumnsEsc)
+import Database.Persist.Sql.Util (dbIdColumnsEsc, commaSeparated, parenWrapped)
 import Database.Persist.Sql.Types.Internal (mkPersistBackend)
 import Data.Fixed (Pico)
 
 import qualified Database.PostgreSQL.Simple as PG
-import qualified Database.PostgreSQL.Simple.TypeInfo as PG
 import qualified Database.PostgreSQL.Simple.TypeInfo.Static as PS
 import qualified Database.PostgreSQL.Simple.Internal as PG
 import qualified Database.PostgreSQL.Simple.ToField as PGTF
@@ -41,9 +45,8 @@ import Database.PostgreSQL.Simple.Ok (Ok (..))
 
 import qualified Database.PostgreSQL.LibPQ as LibPQ
 
-import Control.Monad.Trans.Resource
 import Control.Exception (throw)
-import Control.Monad.IO.Class (MonadIO (..))
+import Control.Monad.IO.Unlift (MonadIO (..), MonadUnliftIO)
 import Data.Data
 import Data.Typeable (Typeable)
 import Data.IORef
@@ -72,7 +75,7 @@ import Data.Aeson
 import Data.Aeson.Types (modifyFailure)
 import Control.Monad (forM)
 import Control.Monad.Trans.Reader (runReaderT)
-import Control.Monad.Trans.Writer (runWriterT)
+import Control.Monad.Trans.Writer (WriterT(..), runWriterT)
 import Data.Acquire (Acquire, mkAcquire, with)
 import System.Environment (getEnvironment)
 import Data.Int (Int64)
@@ -85,13 +88,13 @@ import Control.Exception (Exception, throwIO)
 -- string would be @\"host=localhost port=5432 user=test
 -- dbname=test password=test\"@.  Please read libpq's
 -- documentation at
--- <http://www.postgresql.org/docs/9.1/static/libpq-connect.html>
+-- <https://www.postgresql.org/docs/current/static/libpq-connect.html>
 -- for more details on how to create such strings.
 type ConnectionString = ByteString
 
 -- | PostgresServerVersionError exception. This is thrown when persistent
 -- is unable to find the version of the postgreSQL server.
-data PostgresServerVersionError = PostgresServerVersionError String deriving Typeable
+data PostgresServerVersionError = PostgresServerVersionError String deriving Data.Typeable.Typeable
 
 instance Show PostgresServerVersionError where
     show (PostgresServerVersionError uniqueMsg) =
@@ -101,9 +104,9 @@ instance Exception PostgresServerVersionError
 -- | Create a PostgreSQL connection pool and run the given
 -- action.  The pool is properly released after the action
 -- finishes using it.  Note that you should not use the given
--- 'ConnectionPool' outside the action since it may be already
--- been released.
-withPostgresqlPool :: (MonadBaseControl IO m, MonadLogger m, MonadIO m, IsSqlBackend backend)
+-- 'ConnectionPool' outside the action since it may already
+-- have been released.
+withPostgresqlPool :: (MonadLogger m, MonadUnliftIO m, IsSqlBackend backend)
                    => ConnectionString
                    -- ^ Connection string to the database.
                    -> Int
@@ -113,14 +116,31 @@ withPostgresqlPool :: (MonadBaseControl IO m, MonadLogger m, MonadIO m, IsSqlBac
                    -- ^ Action to be executed that uses the
                    -- connection pool.
                    -> m a
-withPostgresqlPool ci = withSqlPool $ open' (const $ return ()) ci
+withPostgresqlPool ci = withPostgresqlPoolWithVersion getServerVersion ci
 
+-- | Same as 'withPostgresPool', but takes a callback for obtaining
+-- the server version (to work around an Amazon Redshift bug).
+--
+-- @since 2.6.2
+withPostgresqlPoolWithVersion :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+                              => (PG.Connection -> IO (Maybe Double))
+                              -- ^ Action to perform to get the server version.
+                              -> ConnectionString
+                              -- ^ Connection string to the database.
+                              -> Int
+                              -- ^ Number of connections to be kept open in
+                              -- the pool.
+                              -> (Pool backend -> m a)
+                              -- ^ Action to be executed that uses the
+                              -- connection pool.
+                              -> m a
+withPostgresqlPoolWithVersion getVer ci = withSqlPool $ open' (const $ return ()) getVer ci
 
 -- | Create a PostgreSQL connection pool.  Note that it's your
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withPostgresqlPool' for an automatic resource
 -- control.
-createPostgresqlPool :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
+createPostgresqlPool :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
                      => ConnectionString
                      -- ^ Connection string to the database.
                      -> Int
@@ -136,28 +156,58 @@ createPostgresqlPool = createPostgresqlPoolModified (const $ return ())
 --
 -- <https://groups.google.com/d/msg/yesodweb/qUXrEN_swEo/O0pFwqwQIdcJ>
 --
--- Since 2.1.3
+-- @since 2.1.3
 createPostgresqlPoolModified
-    :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
-    => (PG.Connection -> IO ()) -- ^ action to perform after connection is created
+    :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+    => (PG.Connection -> IO ()) -- ^ Action to perform after connection is created.
     -> ConnectionString -- ^ Connection string to the database.
     -> Int -- ^ Number of connections to be kept open in the pool.
     -> m (Pool backend)
-createPostgresqlPoolModified modConn ci = createSqlPool $ open' modConn ci
+createPostgresqlPoolModified = createPostgresqlPoolModifiedWithVersion getServerVersion
+
+-- | Same as other similarly-named functions in this module, but takes callbacks for obtaining
+-- the server version (to work around an Amazon Redshift bug) and connection-specific tweaking
+-- (to change the schema).
+--
+-- @since 2.6.2
+createPostgresqlPoolModifiedWithVersion
+    :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+    => (PG.Connection -> IO (Maybe Double)) -- ^ Action to perform to get the server version.
+    -> (PG.Connection -> IO ()) -- ^ Action to perform after connection is created.
+    -> ConnectionString -- ^ Connection string to the database.
+    -> Int -- ^ Number of connections to be kept open in the pool.
+    -> m (Pool backend)
+createPostgresqlPoolModifiedWithVersion getVer modConn ci =
+  createSqlPool $ open' modConn getVer ci
 
 -- | Same as 'withPostgresqlPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withPostgresqlConn :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
+withPostgresqlConn :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
                    => ConnectionString -> (backend -> m a) -> m a
-withPostgresqlConn = withSqlConn . open' (const $ return ())
+withPostgresqlConn = withPostgresqlConnWithVersion getServerVersion
+
+-- | Same as 'withPostgresqlConn', but takes a callback for obtaining
+-- the server version (to work around an Amazon Redshift bug).
+--
+-- @since 2.6.2
+withPostgresqlConnWithVersion :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+                              => (PG.Connection -> IO (Maybe Double))
+                              -> ConnectionString
+                              -> (backend -> m a)
+                              -> m a
+withPostgresqlConnWithVersion getVer = withSqlConn . open' (const $ return ()) getVer
 
 open'
     :: (IsSqlBackend backend)
-    => (PG.Connection -> IO ()) -> ConnectionString -> LogFunc -> IO backend
-open' modConn cstr logFunc = do
+    => (PG.Connection -> IO ())
+    -> (PG.Connection -> IO (Maybe Double))
+    -> ConnectionString -> LogFunc -> IO backend
+open' modConn getVer cstr logFunc = do
     conn <- PG.connectPostgreSQL cstr
     modConn conn
-    openSimpleConn logFunc conn
+    ver <- getVer conn
+    smap <- newIORef $ Map.empty
+    return $ createBackend logFunc ver smap conn
 
 -- | Gets the PostgreSQL server version
 getServerVersion :: PG.Connection -> IO (Maybe Double)
@@ -175,22 +225,32 @@ getServerVersion conn = do
 -- | Choose upsert sql generation function based on postgresql version.
 -- PostgreSQL version >= 9.5 supports native upsert feature,
 -- so depending upon that we have to choose how the sql query is generated.
-upsertFunction :: Double -> Maybe (EntityDef -> Text -> Text)
-upsertFunction version = if (version >= 9.5)
-                         then Just upsertSql'
+-- upsertFunction :: Double -> Maybe (EntityDef -> Text -> Text)
+upsertFunction :: a -> Double -> Maybe a
+upsertFunction f version = if (version >= 9.5)
+                         then Just f
                          else Nothing
 
--- | Generate a 'Connection' from a 'PG.Connection'
+
+-- | Generate a 'SqlBackend' from a 'PG.Connection'.
 openSimpleConn :: (IsSqlBackend backend) => LogFunc -> PG.Connection -> IO backend
 openSimpleConn logFunc conn = do
     smap <- newIORef $ Map.empty
     serverVersion <- getServerVersion conn
-    return . mkPersistBackend $ SqlBackend
+    return $ createBackend logFunc serverVersion smap conn
+
+-- | Create the backend given a logging function, server version, mutable statement cell,
+-- and connection.
+createBackend :: IsSqlBackend backend => LogFunc -> Maybe Double
+              -> IORef (Map.Map Text Statement) -> PG.Connection -> backend
+createBackend logFunc serverVersion smap conn = do
+    mkPersistBackend $ SqlBackend
         { connPrepare    = prepare' conn
         , connStmtMap    = smap
         , connInsertSql  = insertSql'
         , connInsertManySql = Just insertManySql'
-        , connUpsertSql = maybe Nothing upsertFunction serverVersion
+        , connUpsertSql  = serverVersion >>= upsertFunction upsertSql'
+        , connPutManySql = serverVersion >>= upsertFunction putManySql
         , connClose      = PG.close conn
         , connMigrateSql = migrate'
         , connBegin      = const $ PG.begin    conn
@@ -201,6 +261,7 @@ openSimpleConn logFunc conn = do
         , connRDBMS      = "postgresql"
         , connLimitOffset = decorateSQLWithLimitOffset "LIMIT ALL"
         , connLogFunc = logFunc
+        , connMaxParams = Nothing
         }
 
 prepare' :: PG.Connection -> Text -> IO Statement
@@ -269,7 +330,7 @@ insertManySql' ent valss =
                 , ") VALUES ("
                 , T.intercalate "),(" $ replicate (length valss) $ T.intercalate "," $ map (const "?") (entityFields ent)
                 , ") RETURNING "
-                , T.intercalate ", " $ dbIdColumnsEsc escape ent
+                , commaSeparated $ dbIdColumnsEsc escape ent
                 ]
   in ISRSingle sql
 
@@ -280,7 +341,7 @@ withStmt' :: MonadIO m
           => PG.Connection
           -> PG.Query
           -> [PersistValue]
-          -> Acquire (Source m [PersistValue])
+          -> Acquire (ConduitM () [PersistValue] m ())
 withStmt' conn query vals =
     pull `fmap` mkAcquire openS closeS
   where
@@ -470,7 +531,7 @@ doesTableExist :: (Text -> IO Statement)
                -> IO Bool
 doesTableExist getter (DBName name) = do
     stmt <- getter sql
-    with (stmtQuery stmt vals) ($$ start)
+    with (stmtQuery stmt vals) (\src -> runConduit $ src .| start)
   where
     sql = "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname != 'pg_catalog'"
           <> " AND schemaname != 'information_schema' AND tablename=?"
@@ -561,7 +622,7 @@ mayDefault def = case def of
 
 type SafeToRemove = Bool
 
-data AlterColumn = Type SqlType Text
+data AlterColumn = ChangeType SqlType Text
                  | IsNull | NotNull | Add' Column | Drop SafeToRemove
                  | Default Text | NoDefault | Update' Text
                  | AddReference DBName [DBName] [Text] | DropReference DBName
@@ -582,22 +643,29 @@ getColumns getter def = do
     let sqlv=T.concat ["SELECT "
                           ,"column_name "
                           ,",is_nullable "
-                          ,",udt_name "
+                          ,",COALESCE(domain_name, udt_name)" -- See DOMAINS below
                           ,",column_default "
                           ,",numeric_precision "
                           ,",numeric_scale "
+                          ,",character_maximum_length "
                           ,"FROM information_schema.columns "
                           ,"WHERE table_catalog=current_database() "
                           ,"AND table_schema=current_schema() "
                           ,"AND table_name=? "
                           ,"AND column_name <> ?"]
 
+-- DOMAINS Postgres supports the concept of domains, which are data types with optional constraints.
+-- An app might make an "email" domain over the varchar type, with a CHECK that the emails are valid
+-- In this case the generated SQL should use the domain name: ALTER TABLE users ALTER COLUMN foo TYPE email
+-- This code exists to use the domain name (email), instead of the underlying type (varchar).
+-- This is tested in EquivalentTypeTest.hs
+
     stmt <- getter sqlv
     let vals =
             [ PersistText $ unDBName $ entityDB def
             , PersistText $ unDBName $ fieldDB (entityId def)
             ]
-    cs <- with (stmtQuery stmt vals) ($$ helper)
+    cs <- with (stmtQuery stmt vals) (\src -> runConduit $ src .| helper)
     let sqlc = T.concat ["SELECT "
                           ,"c.constraint_name, "
                           ,"c.column_name "
@@ -616,7 +684,7 @@ getColumns getter def = do
 
     stmt' <- getter sqlc
 
-    us <- with (stmtQuery stmt' vals) ($$ helperU)
+    us <- with (stmtQuery stmt' vals) (\src -> runConduit $ src .| helperU)
     return $ cs ++ us
   where
     getAll front = do
@@ -684,24 +752,27 @@ getAlters defs def (c1, u1) (c2, u2) =
 getColumn :: (Text -> IO Statement)
           -> DBName -> [PersistValue]
           -> IO (Either Text Column)
-getColumn getter tname [PersistText x, PersistText y, PersistText z, d, npre, nscl] =
+getColumn getter tableName' [PersistText columnName, PersistText isNullable, PersistText typeName, defaultValue, numericPrecision, numericScale, maxlen] =
     case d' of
         Left s -> return $ Left s
         Right d'' ->
-            case getType z of
-                Left s -> return $ Left s
-                Right t -> do
-                    let cname = DBName x
-                    ref <- getRef cname
-                    return $ Right Column
-                        { cName = cname
-                        , cNull = y == "YES"
-                        , cSqlType = t
-                        , cDefault = fmap stripSuffixes d''
-                        , cDefaultConstraintName = Nothing
-                        , cMaxLen = Nothing
-                        , cReference = ref
-                        }
+            let typeStr = case maxlen of
+                            PersistInt64 n -> T.concat [typeName, "(", T.pack (show n), ")"]
+                            _              -> typeName
+             in case getType typeStr of
+                  Left s -> return $ Left s
+                  Right t -> do
+                      let cname = DBName columnName
+                      ref <- getRef cname
+                      return $ Right Column
+                          { cName = cname
+                          , cNull = isNullable == "YES"
+                          , cSqlType = t
+                          , cDefault = fmap stripSuffixes d''
+                          , cDefaultConstraintName = Nothing
+                          , cMaxLen = Nothing
+                          , cReference = ref
+                          }
   where
     stripSuffixes t =
         loop'
@@ -724,21 +795,22 @@ getColumn getter tname [PersistText x, PersistText y, PersistText z, d, npre, ns
                 , "AND constraint_type='FOREIGN KEY' "
                 , "AND constraint_name=?"
                 ]
-        let ref = refName tname cname
+        let ref = refName tableName' cname
         stmt <- getter sql
         with (stmtQuery stmt
-                     [ PersistText $ unDBName tname
+                     [ PersistText $ unDBName tableName'
                      , PersistText $ unDBName ref
-                     ]) ($$ do
+                     ]) (\src -> runConduit $ src .| do
             Just [PersistInt64 i] <- CL.head
             return $ if i == 0 then Nothing else Just (DBName "", ref))
-    d' = case d of
+    d' = case defaultValue of
             PersistNull   -> Right Nothing
             PersistText t -> Right $ Just t
-            _ -> Left $ T.pack $ "Invalid default column: " ++ show d
+            _ -> Left $ T.pack $ "Invalid default column: " ++ show defaultValue
     getType "int4"        = Right SqlInt32
     getType "int8"        = Right SqlInt64
     getType "varchar"     = Right SqlString
+    getType "text"        = Right SqlString
     getType "date"        = Right SqlDay
     getType "bool"        = Right SqlBool
     getType "timestamptz" = Right SqlDayTime
@@ -746,13 +818,34 @@ getColumn getter tname [PersistText x, PersistText y, PersistText z, d, npre, ns
     getType "float8"      = Right SqlReal
     getType "bytea"       = Right SqlBlob
     getType "time"        = Right SqlTime
-    getType "numeric"     = getNumeric npre nscl
+    getType "numeric"     = getNumeric numericPrecision numericScale
     getType a             = Right $ SqlOther a
 
     getNumeric (PersistInt64 a) (PersistInt64 b) = Right $ SqlNumeric (fromIntegral a) (fromIntegral b)
-    getNumeric a b = Left $ T.pack $ "Can not get numeric field precision, got: " ++ show a ++ " and " ++ show b ++ " as precision and scale"
-getColumn _ _ x =
-    return $ Left $ T.pack $ "Invalid result from information_schema: " ++ show x
+    getNumeric PersistNull PersistNull = Left $ T.concat
+      [ "No precision and scale were specified for the column: "
+      , columnName
+      , " in table: "
+      , unDBName tableName'
+      , ". Postgres defaults to a maximum scale of 147,455 and precision of 16383,"
+      , " which is probably not what you intended."
+      , " Specify the values as numeric(total_digits, digits_after_decimal_place)."
+      ]
+    getNumeric a b = Left $ T.concat
+      [ "Can not get numeric field precision for the column: "
+      , columnName
+      , " in table: "
+      , unDBName tableName'
+      , ". Expected an integer for both precision and scale, "
+      , "got: "
+      , T.pack $ show a
+      , " and "
+      , T.pack $ show b
+      , ", respectively."
+      , " Specify the values as numeric(total_digits, digits_after_decimal_place)."
+      ]
+getColumn _ _ columnName =
+    return $ Left $ T.pack $ "Invalid result from information_schema: " ++ show columnName
 
 -- | Intelligent comparison of SQL types, to account for SqlInt32 vs SqlOther integer
 sqlTypeEq :: SqlType -> SqlType -> Bool
@@ -789,12 +882,12 @@ findAlters defs _tablename col@(Column name isNull sqltype def _defConstraintNam
                     -- need to make sure that TIMESTAMP WITHOUT TIME ZONE is
                     -- treated as UTC.
                     | sqltype == SqlDayTime && sqltype' == SqlOther "timestamp" =
-                        [(name, Type sqltype $ T.concat
+                        [(name, ChangeType sqltype $ T.concat
                             [ " USING "
                             , escape name
                             , " AT TIME ZONE 'UTC'"
                             ])]
-                    | otherwise = [(name, Type sqltype "")]
+                    | otherwise = [(name, ChangeType sqltype "")]
                 modDef =
                     if def == def'
                         then []
@@ -873,7 +966,7 @@ showAlterTable table (DropConstraint cname) = T.concat
     ]
 
 showAlter :: DBName -> AlterColumn' -> Text
-showAlter table (n, Type t extra) =
+showAlter table (n, ChangeType t extra) =
     T.concat
         [ "ALTER TABLE "
         , escape table
@@ -960,13 +1053,13 @@ showAlter table (_, DropReference cname) = T.concat
     , escape cname
     ]
 
--- | get the SQL string for the table that a PeristEntity represents
--- Useful for raw SQL queries
+-- | Get the SQL string for the table that a PeristEntity represents.
+-- Useful for raw SQL queries.
 tableName :: (PersistEntity record) => record -> Text
 tableName = escape . tableDBName
 
--- | get the SQL string for the field that an EntityField represents
--- Useful for raw SQL queries
+-- | Get the SQL string for the field that an EntityField represents.
+-- Useful for raw SQL queries.
 fieldName :: (PersistEntity record) => EntityField record typ -> Text
 fieldName = escape . fieldDBName
 
@@ -985,7 +1078,7 @@ data PostgresConf = PostgresConf
     { pgConnStr  :: ConnectionString
       -- ^ The connection string.
     , pgPoolSize :: Int
-      -- ^ How many connections should be held on the connection pool.
+      -- ^ How many connections should be held in the connection pool.
     } deriving (Show, Read, Data, Typeable)
 
 instance FromJSON PostgresConf where
@@ -1087,7 +1180,7 @@ mockMigrate allDefs _ entity = fmap (fmap $ map showAlterDb) $ do
 
 -- | Mock a migration even when the database is not present.
 -- This function performs the same functionality of 'printMigration'
--- with the difference that an actualy database isn't needed for it.
+-- with the difference that an actual database is not needed.
 mockMigration :: Migration -> IO ()
 mockMigration mig = do
   smap <- newIORef $ Map.empty
@@ -1101,6 +1194,7 @@ mockMigration mig = do
                              connInsertManySql = Nothing,
                              connInsertSql = undefined,
                              connUpsertSql = Nothing,
+                             connPutManySql = Nothing,
                              connStmtMap = smap,
                              connClose = undefined,
                              connMigrateSql = mockMigrate,
@@ -1111,7 +1205,45 @@ mockMigration mig = do
                              connNoLimit = undefined,
                              connRDBMS = undefined,
                              connLimitOffset = undefined,
-                             connLogFunc = undefined}
+                             connLogFunc = undefined,
+                             connMaxParams = Nothing}
       result = runReaderT $ runWriterT $ runWriterT mig
   resp <- result sqlbackend
   mapM_ T.putStrLn $ map snd $ snd resp
+
+putManySql :: EntityDef -> Int -> Text
+putManySql entityDef' numRecords
+  | numRecords > 0 = q
+  | otherwise = error "putManySql: numRecords MUST be greater than 0!"
+  where
+    tableName' = escape . entityDB $ entityDef'
+    fieldDbToText = escape . fieldDB
+    entityFieldNames = map fieldDbToText (entityFields entityDef')
+    recordPlaceholders= parenWrapped . commaSeparated
+                      $ map (const "?") (entityFields entityDef')
+    mkAssignment n = T.concat [n, "=EXCLUDED.", n]
+    fieldSets = map (mkAssignment . fieldDbToText) (entityFields entityDef')
+    uniqueFields' = concat $ map (\x -> map escape (map snd $ uniqueFields x)) (entityUniques entityDef')
+    q = T.concat
+        [ "INSERT INTO "
+        , tableName'
+        , " ("
+        , commaSeparated entityFieldNames
+        , ") "
+        , " VALUES "
+        , commaSeparated (replicate numRecords recordPlaceholders)
+        , "  ON CONFLICT ("
+        , commaSeparated uniqueFields'
+        , ") DO UPDATE SET "
+        , commaSeparated fieldSets
+        ]
+
+-- | Enable a Postgres extension. See https://www.postgresql.org/docs/current/static/contrib.html
+-- for a list.
+migrateEnableExtension :: Text -> Migration
+migrateEnableExtension extName = WriterT $ WriterT $ do
+  res :: [Single Int] <-
+    rawSql "SELECT COUNT(*) FROM pg_catalog.pg_extension WHERE extname = ?" [PersistText extName]
+  if res == [Single 0]
+    then return (((), []) , [(False, "CREATe EXTENSION \"" <> extName <> "\"")])
+    else return (((), []), [])

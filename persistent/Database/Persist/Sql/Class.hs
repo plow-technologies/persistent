@@ -7,15 +7,18 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE UndecidableInstances #-}
-#ifndef NO_OVERLAP
+{-# LANGUAGE PatternGuards #-}
+
+#if !MIN_VERSION_base(4,8,0)
 {-# LANGUAGE OverlappingInstances #-}
 #endif
+
 module Database.Persist.Sql.Class
     ( RawSql (..)
     , PersistFieldSql (..)
     ) where
 
-import Control.Applicative ((<$>), (<*>))
+import Control.Applicative as A ((<$>), (<*>))
 import Database.Persist
 import Data.Monoid ((<>))
 import Database.Persist.Sql.Types
@@ -33,7 +36,7 @@ import Data.Int
 import Data.Word
 import Data.ByteString (ByteString)
 import Text.Blaze.Html (Html)
-import Data.Bits (bitSize)
+import Data.Bits (bitSizeMaybe)
 import qualified Data.Vector as V
 
 #if MIN_VERSION_base(4,8,0)
@@ -57,7 +60,7 @@ class RawSql a where
 instance PersistField a => RawSql (Single a) where
     rawSqlCols _ _         = (1, [])
     rawSqlColCountReason _ = "one column for a 'Single' data type"
-    rawSqlProcessRow [pv]  = Single <$> fromPersistValue pv
+    rawSqlProcessRow [pv]  = Single A.<$> fromPersistValue pv
     rawSqlProcessRow _     = Left $ pack "RawSql (Single a): wrong number of columns."
 
 instance
@@ -72,7 +75,7 @@ instance
 instance
     (PersistEntity record, PersistEntityBackend record ~ backend, IsPersistBackend backend) =>
     RawSql (Entity record) where
-    rawSqlCols escape ent = (length sqlFields, [intercalate ", " sqlFields])
+    rawSqlCols escape _ent = (length sqlFields, [intercalate ", " sqlFields])
         where
           sqlFields = map (((name <> ".") <>) . escape)
               $ map fieldDB
@@ -86,13 +89,13 @@ instance
           1 -> "one column for an 'Entity' data type without fields"
           n -> show n ++ " columns for an 'Entity' data type"
     rawSqlProcessRow row = case splitAt nKeyFields row of
-      (rowKey, rowVal) -> Entity <$> keyFromValues rowKey
-                                 <*> fromPersistValues rowVal
+      (rowKey, rowVal) -> Entity A.<$> keyFromValues rowKey
+                                 A.<*> fromPersistValues rowVal
       where
         nKeyFields = length $ entityKeyFields entDef
         entDef = entityDef (Nothing :: Maybe record)
 
--- | Since 1.0.1.
+-- | @since 1.0.1
 instance RawSql a => RawSql (Maybe a) where
     rawSqlCols e = rawSqlCols e . extractMaybe
     rawSqlColCountReason = rawSqlColCountReason . extractMaybe
@@ -208,11 +211,73 @@ to8 ((a,b),(c,d),(e,f),(g,h)) = (a,b,c,d,e,f,g,h)
 extractMaybe :: Maybe a -> a
 extractMaybe = fromMaybe (error "Database.Persist.GenericSql.extractMaybe")
 
+-- | Tells Persistent what database column type should be used to store a Haskell type.
+--
+-- ==== __Examples__
+--
+-- ===== Simple Boolean Alternative
+--
+-- @
+-- data Switch = On | Off
+--   deriving (Show, Eq)
+--
+-- instance 'PersistField' Switch where
+--   'toPersistValue' s = case s of
+--     On -> 'PersistBool' True
+--     Off -> 'PersistBool' False
+--   'fromPersistValue' ('PersistBool' b) = if b then 'Right' On else 'Right' Off
+--   'fromPersistValue' x = Left $ "File.hs: When trying to deserialize a Switch: expected PersistBool, received: " <> T.pack (show x)
+--
+-- instance 'PersistFieldSql' Switch where
+--   'sqlType' _ = 'SqlBool'
+-- @
+--
+-- ===== Non-Standard Database Types
+--
+-- If your database supports non-standard types, such as Postgres' @uuid@, you can use 'SqlOther' to use them:
+--
+-- @
+-- import qualified Data.UUID as UUID
+-- instance 'PersistField' UUID where
+--   'toPersistValue' = 'PersistDbSpecific' . toASCIIBytes
+--   'fromPersistValue' ('PersistDbSpecific' uuid) =
+--     case fromASCIIBytes uuid of
+--       'Nothing' -> 'Left' $ "Model/CustomTypes.hs: Failed to deserialize a UUID; received: " <> T.pack (show uuid)
+--       'Just' uuid' -> 'Right' uuid'
+--   'fromPersistValue' x = Left $ "File.hs: When trying to deserialize a UUID: expected PersistDbSpecific, received: "-- >  <> T.pack (show x)
+--
+-- instance 'PersistFieldSql' UUID where
+--   'sqlType' _ = 'SqlOther' "uuid"
+-- @
+--
+-- ===== User Created Database Types
+--
+-- Similarly, some databases support creating custom types, e.g. Postgres' <https://www.postgresql.org/docs/current/static/sql-createdomain.html DOMAIN> and <https://www.postgresql.org/docs/current/static/datatype-enum.html ENUM> features. You can use 'SqlOther' to specify a custom type:
+--
+-- > CREATE DOMAIN ssn AS text
+-- >       CHECK ( value ~ '^[0-9]{9}$');
+--
+-- @
+-- instance 'PersistFieldSQL' SSN where
+--   'sqlType' _ = 'SqlOther' "ssn"
+-- @
+--
+-- > CREATE TYPE rainbow_color AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'indigo', 'violet');
+--
+-- @
+-- instance 'PersistFieldSQL' RainbowColor where
+--   'sqlType' _ = 'SqlOther' "rainbow_color"
+-- @
 class PersistField a => PersistFieldSql a where
     sqlType :: Proxy a -> SqlType
 
 #ifndef NO_OVERLAP
-instance PersistFieldSql String where
+
+#if MIN_VERSION_base(4,8,0)
+instance {-# OVERLAPPING #-} PersistFieldSql [Char] where
+#else
+instance PersistFieldSql [Char] where
+#endif
     sqlType _ = SqlString
 #endif
 
@@ -226,7 +291,7 @@ instance PersistFieldSql Html where
     sqlType _ = SqlString
 instance PersistFieldSql Int where
     sqlType _
-        | bitSize (0 :: Int) <= 32 = SqlInt32
+        | Just x <- bitSizeMaybe (0 :: Int), x <= 32 = SqlInt32
         | otherwise = SqlInt64
 instance PersistFieldSql Int8 where
     sqlType _ = SqlInt32
@@ -256,7 +321,11 @@ instance PersistFieldSql TimeOfDay where
     sqlType _ = SqlTime
 instance PersistFieldSql UTCTime where
     sqlType _ = SqlDayTime
+#if MIN_VERSION_base(4,8,0)
+instance {-# OVERLAPPABLE #-} PersistFieldSql a => PersistFieldSql [a] where
+#else
 instance PersistFieldSql a => PersistFieldSql [a] where
+#endif
     sqlType _ = SqlString
 instance PersistFieldSql a => PersistFieldSql (V.Vector a) where
   sqlType _ = SqlString

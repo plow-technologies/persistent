@@ -1,3 +1,59 @@
+## 2.8.2
+
+* Added support for `sql=` to the unique constraints quasi-quoter so that users can specify the database names of the constraints.
+
+## 2.8.1
+
+* DRY-ed up and exposed several util functions in `Database.Persist.Sql.Util`.
+	* Upstream-ed `updatePersistValue`, `mkUpdateText`, and `commaSeparated` from `Database.Persist.MySQL`.
+	* De-duplicated `updatePersistValue` from various `Database.Persist.Sql.Orphan.*` modules.
+* Batching enhancements to reduce db round-trips.
+	* Added `getMany` and `repsertMany` for batched `get` and `repsert`.
+	* Added `putMany` with a default/slow implementation. SqlBackend's that support native UPSERT should override this for batching enhancements.
+	* Updated `insertEntityMany` to replace slow looped usage with batched execution.
+* See [#770](https://github.com/yesodweb/persistent/pull/770)
+
+## 2.8.0
+
+* Switch from `MonadBaseControl` to `MonadUnliftIO`
+* Reapplies [#723](https://github.com/yesodweb/persistent/pull/723), which was reverted in version 2.7.3.
+
+## 2.7.3.1
+
+ * Improve error messages when failing to parse database results into Persistent records. [#741](https://github.com/yesodweb/persistent/pull/741)
+ * A handful of `fromPersistField` implementations called `error` instead of returning a `Left Text`. All of the implementations were changed to return `Left`. [#741](https://github.com/yesodweb/persistent/pull/741)
+ * Improve error message when a SQL insert fails with a custom primary key [#757](https://github.com/yesodweb/persistent/pull/757)
+
+## 2.7.3
+
+* Reverts [#723](https://github.com/yesodweb/persistent/pull/723), which generalized functions using the `BackendCompatible` class. These changes were an accidental breaking change.
+* Recommend the `PersistDbSpecific` docs if someone gets an error about converting from `PersistDbSpecific`
+
+## 2.7.2 [DEPRECATED ON HACKAGE]
+
+* Many of the functions have been generalized using the `BackendCompatible` class. [#723](https://github.com/yesodweb/persistent/pull/723)
+	* This change was an accidental breaking change and was reverted in 2.7.3.
+	* These change will be released in a future version of Persistent with a major version bump.
+* Add raw sql quasi quoters [#717](https://github.com/yesodweb/persistent/pull/717)
+
+## 2.7.1
+
+* Added an `insertUniqueEntity` function [#718](https://github.com/yesodweb/persistent/pull/718)
+* Added `BackendCompatible` class [#701](https://github.com/yesodweb/persistent/pull/701)
+
+## 2.7.0
+
+* Fix upsert behavior [#613](https://github.com/yesodweb/persistent/issues/613)
+* Atomic upsert query fixed for arithmatic operations [#662](https://github.com/yesodweb/persistent/issues/662)
+* Haddock and test coverage improved for upsert
+
+## 2.6.1
+
+* Fix edge case for `\<-. [Nothing]`
+* Introduce `connMaxParams`
+* Add 'getJustEntity' and 'insertRecord' convenience function
+* Minor Haddock improvment
+
 ## 2.6
 
 * Add `connUpsertSql` type for providing backend-specific upsert sql support.

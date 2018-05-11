@@ -1,4 +1,4 @@
-resolver: lts-5.1
+resolver: lts-10.4
 packages:
   - ./persistent
   - ./persistent-template
@@ -8,20 +8,13 @@ packages:
   - ./persistent-mysql
   - ./persistent-postgresql
   - ./persistent-redis
-  # - ./persistent-zookeeper
-
 extra-deps:
-  - aeson-compat-0.3.5.1
-  - recursion-schemes-4.1.2
-  - aeson-1.0.0.0
-  - attoparsec-0.13.0.1
-  - http-api-data-0.2
-  - time-parsers-0.1.0.0
-  - fail-4.9.0.0
-  - base-compat-0.9.1
-  - scientific-0.3.4.9
-  - semigroups-0.18.2
+- monad-logger-0.3.28.1
+- mysql-simple-0.4.4
 
-flags:
-  semigroups:
-    bytestring-builder: false
+- mono-traversable-1.0.8.1
+- unliftio-0.2.4.0
+- unliftio-core-0.1.1.0
+- async-2.1.1.1
+- typed-process-0.2.1.0
+- resourcet-1.1.11

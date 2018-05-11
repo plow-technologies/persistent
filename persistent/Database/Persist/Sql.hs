@@ -10,6 +10,8 @@ module Database.Persist.Sql
     , rawExecute
     , rawExecuteCount
     , rawSql
+    , sqlQQ
+    , executeQQ
     , deleteWhereCount
     , updateWhereCount
     , transactionSave
@@ -25,10 +27,11 @@ import Database.Persist.Sql.Types
 import Database.Persist.Sql.Class
 import Database.Persist.Sql.Run hiding (withResourceTimeout)
 import Database.Persist.Sql.Raw
+import Database.Persist.Sql.Raw.QQ
 import Database.Persist.Sql.Migration
 import Database.Persist.Sql.Internal
 
-import Database.Persist.Sql.Orphan.PersistQuery 
+import Database.Persist.Sql.Orphan.PersistQuery
 import Database.Persist.Sql.Orphan.PersistStore
 import Database.Persist.Sql.Orphan.PersistUnique ()
 import Control.Monad.IO.Class
@@ -36,7 +39,7 @@ import Control.Monad.Trans.Reader (ReaderT, ask)
 
 -- | Commit the current transaction and begin a new one.
 --
--- Since 1.2.0
+-- @since 1.2.0
 transactionSave :: MonadIO m => ReaderT SqlBackend m ()
 transactionSave = do
     conn <- ask
@@ -45,7 +48,7 @@ transactionSave = do
 
 -- | Roll back the current transaction and begin a new one.
 --
--- Since 1.2.0
+-- @since 1.2.0
 transactionUndo :: MonadIO m => ReaderT SqlBackend m ()
 transactionUndo = do
     conn <- ask

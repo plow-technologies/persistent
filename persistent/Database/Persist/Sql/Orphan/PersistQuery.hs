@@ -11,7 +11,8 @@ module Database.Persist.Sql.Orphan.PersistQuery
 
 import Database.Persist hiding (updateField)
 import Database.Persist.Sql.Util (
-  entityColumnNames, parseEntityValues, isIdField)
+    entityColumnNames, parseEntityValues, isIdField, updatePersistValue
+  , mkUpdateText, commaSeparated)
 import Database.Persist.Sql.Types
 import Database.Persist.Sql.Raw
 import Database.Persist.Sql.Orphan.PersistStore (withRawQuery)
@@ -57,7 +58,7 @@ instance PersistQueryRead SqlBackend where
     selectSourceRes filts opts = do
         conn <- ask
         srcRes <- rawQueryRes (sql conn) (getFiltsValues conn filts)
-        return $ fmap ($= CL.mapM parse) srcRes
+        return $ fmap (.| CL.mapM parse) srcRes
       where
         (limit, offset, orders) = limitOffsetOrder opts
 
@@ -72,7 +73,7 @@ instance PersistQueryRead SqlBackend where
             case map (orderClause False conn) orders of
                 [] -> ""
                 ords -> " ORDER BY " <> T.intercalate "," ords
-        cols = T.intercalate ", " . entityColumnNames t
+        cols = commaSeparated . entityColumnNames t
         sql conn = connLimitOffset conn (limit,offset) (not (null orders)) $ mconcat
             [ "SELECT "
             , cols conn
@@ -85,7 +86,7 @@ instance PersistQueryRead SqlBackend where
     selectKeysRes filts opts = do
         conn <- ask
         srcRes <- rawQueryRes (sql conn) (getFiltsValues conn filts)
-        return $ fmap ($= CL.mapM parse) srcRes
+        return $ fmap (.| CL.mapM parse) srcRes
       where
         t = entityDef $ dummyFromFilts filts
         cols conn = T.intercalate "," $ dbIdColumns conn t
@@ -116,14 +117,14 @@ instance PersistQueryRead SqlBackend where
                         case xs of
                            [PersistInt64 x] -> return [PersistInt64 x]
                            [PersistDouble x] -> return [PersistInt64 (truncate x)] -- oracle returns Double
-                           _ -> liftIO $ throwIO $ PersistMarshalError $ "Unexpected in selectKeys False: " <> T.pack (show xs)
+                           _ -> return xs
                       Just pdef ->
                            let pks = map fieldHaskell $ compositeFields pdef
                                keyvals = map snd $ filter (\(a, _) -> let ret=isJust (find (== a) pks) in ret) $ zip (map fieldHaskell $ entityFields t) xs
                            in return keyvals
             case keyFromValues keyvals of
                 Right k -> return k
-                Left _ -> error "selectKeysImpl: keyFromValues failed"
+                Left err -> error $ "selectKeysImpl: keyFromValues failed" <> show err
 instance PersistQueryRead SqlReadBackend where
     count filts = withReaderT persistBackend $ count filts
     selectSourceRes filts opts = withReaderT persistBackend $ selectSourceRes filts opts
@@ -146,7 +147,7 @@ instance PersistQueryWrite SqlWriteBackend where
 
 -- | Same as 'deleteWhere', but returns the number of rows affected.
 --
--- Since 1.1.5
+-- @since 1.1.5
 deleteWhereCount :: (PersistEntity val, MonadIO m, PersistEntityBackend val ~ SqlBackend, IsSqlBackend backend)
                  => [Filter val]
                  -> ReaderT backend m Int64
@@ -165,7 +166,7 @@ deleteWhereCount filts = withReaderT persistBackend $ do
 
 -- | Same as 'updateWhere', but returns the number of rows affected.
 --
--- Since 1.1.5
+-- @since 1.1.5
 updateWhereCount :: (PersistEntity val, MonadIO m, SqlBackend ~ PersistEntityBackend val, IsSqlBackend backend)
                  => [Filter val]
                  -> [Update val]
@@ -180,25 +181,14 @@ updateWhereCount filts upds = withReaderT persistBackend $ do
             [ "UPDATE "
             , connEscapeName conn $ entityDB t
             , " SET "
-            , T.intercalate "," $ map (go' conn . go) upds
+            , T.intercalate "," $ map (mkUpdateText conn) upds
             , wher
             ]
-    let dat = map updatePersistValue upds `mappend`
+    let dat = map updatePersistValue upds `Data.Monoid.mappend`
               getFiltsValues conn filts
     rawExecuteCount sql dat
   where
     t = entityDef $ dummyFromFilts filts
-    go'' n Assign = n <> "=?"
-    go'' n Add = mconcat [n, "=", n, "+?"]
-    go'' n Subtract = mconcat [n, "=", n, "-?"]
-    go'' n Multiply = mconcat [n, "=", n, "*?"]
-    go'' n Divide = mconcat [n, "=", n, "/?"]
-    go'' _ (BackendSpecificUpdate up) = error $ T.unpack $ "BackendSpecificUpdate" `mappend` up `mappend` "not supported"
-    go' conn (x, pu) = go'' (connEscapeName conn x) pu
-    go x = (updateField x, updateUpdate x)
-
-    updateField (Update f _ _) = fieldName f
-    updateField _ = error "BackendUpdate not implemented"
 
 fieldName ::  forall record typ.  (PersistEntity record, PersistEntityBackend record ~ SqlBackend) => EntityField record typ -> DBName
 fieldName f = fieldDB $ persistFieldDef f
@@ -273,7 +263,7 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
                  (True, Just pdef, _) ->
                      error $ "unhandled error for composite/non id primary keys filter=" ++ show pfilter ++ " persistList=" ++ show allVals ++ " pdef=" ++ show pdef
 
-                 _ ->   case (isNull, pfilter, varCount) of
+                 _ ->   case (isNull, pfilter, length notNullVals) of
                             (True, Eq, _) -> (name <> " IS NULL", [])
                             (True, Ne, _) -> (name <> " IS NOT NULL", [])
                             (False, Ne, _) -> (T.concat
@@ -298,7 +288,8 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
                                 , qmarks
                                 , ")"
                                 ], notNullVals)
-                            (_, NotIn, 0) -> ("1=1", [])
+                            (False, NotIn, 0) -> ("1=1", [])
+                            (True, NotIn, 0) -> (name <> " IS NOT NULL", [])
                             (False, NotIn, _) -> (T.concat
                                 [ "("
                                 , name
@@ -353,9 +344,6 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
                     Right x ->
                         let x' = filter (/= PersistNull) $ map toPersistValue x
                          in "(" <> T.intercalate "," (map (const "?") x') <> ")"
-        varCount = case value of
-                    Left _ -> 1
-                    Right x -> length x
         showSqlFilter Eq = "="
         showSqlFilter Ne = "<>"
         showSqlFilter Gt = ">"
@@ -365,10 +353,6 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
         showSqlFilter In = " IN "
         showSqlFilter NotIn = " NOT IN "
         showSqlFilter (BackendSpecificFilter s) = s
-
-updatePersistValue :: Update v -> PersistValue
-updatePersistValue (Update _ v _) = toPersistValue v
-updatePersistValue _ = error "BackendUpdate not implemented"
 
 filterClause :: (PersistEntity val, PersistEntityBackend val ~ SqlBackend)
              => Bool -- ^ include table name?

@@ -1,27 +1,27 @@
 {-# OPTIONS_GHC -fno-warn-unused-binds -fno-warn-orphans #-}
-{-# LANGUAGE UndecidableInstances #-} -- FIXME
-{-# LANGUAGE QuasiQuotes #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE EmptyDataDecls #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE EmptyDataDecls #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-} -- FIXME
 module CompositeTest where
 
 import Test.Hspec.Expectations ()
-import qualified Control.Monad.Trans.Control
-import qualified Control.Exception as E
 import Init
+#ifndef WITH_NOSQL
+import qualified Data.Map as Map
+#endif
 
 #ifndef WITH_NOSQL
 import Data.Maybe (isJust)
@@ -265,19 +265,31 @@ specs = describe "composite" $
       ca1 @== newca2
     it "insertMany" $ db $ do
       [kp1, kp2] <- insertMany [p1, p2]
-      newp1 <- get kp1
-      newp1 @== Just p1
-
-      newp2 <- get kp2
-      newp2 @== Just p2
+      rs <- getMany [kp1, kp2]
+      rs @== Map.fromList [(kp1, p1), (kp2, p2)]
     it "RawSql Key instance" $ db $ do
       key <- insert p1
       keyFromRaw <- rawSql "SELECT name, name2, age FROM test_parent LIMIT 1" []
       [key] @== keyFromRaw
+
+    it "RawSql Key instance with sqlQQ" $ db $ do
+      key <- insert p1
+      keyFromRaw' <- [sqlQQ|
+          SELECT @{TestParentName}, @{TestParentName2}, @{TestParentAge}
+            FROM ^{TestParent}
+            LIMIT 1
+      |]
+      [key] @== keyFromRaw'
+
     it "RawSql Entity instance" $ db $ do
       key <- insert p1
       newp1 <- rawSql "SELECT ?? FROM test_parent LIMIT 1" []
       [Entity key p1] @== newp1
+
+    it "RawSql Entity instance with sqlQQ" $ db $ do
+      key <- insert p1
+      newp1' <- [sqlQQ| SELECT ?? FROM ^{TestParent} |]
+      [Entity key p1] @== newp1'
 
 #endif
 
@@ -296,11 +308,3 @@ matchParentK = (\(a:b:c:[]) -> (,,) <$> fromPersistValue a <*> fromPersistValue 
 matchCitizenAddressK :: Key CitizenAddress -> Either Text (Int64, Int64)
 matchCitizenAddressK = (\(a:b:[]) -> (,) <$> fromPersistValue a <*> fromPersistValue b)
                      . keyToValues
-
-catch' :: (Control.Monad.Trans.Control.MonadBaseControl IO m, E.Exception e)
-       => m a       -- ^ The computation to run
-       -> (e -> m a) -- ^ Handler to invoke if an exception is raised
-       -> m a
-catch' a handler = Control.Monad.Trans.Control.control $ \runInIO ->
-                    E.catch (runInIO a)
-                            (\e -> runInIO $ handler e)

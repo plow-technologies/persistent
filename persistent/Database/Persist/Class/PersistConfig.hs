@@ -7,9 +7,8 @@ module Database.Persist.Class.PersistConfig
 
 import Data.Aeson (Value (Object))
 import Data.Aeson.Types (Parser)
-import Control.Monad.IO.Class (MonadIO)
-import Control.Monad.Trans.Control (MonadBaseControl)
-import Control.Applicative ((<$>))
+import Control.Monad.IO.Unlift (MonadUnliftIO)
+import Control.Applicative as A ((<$>))
 import qualified Data.HashMap.Strict as HashMap
 
 -- | Represents a value containing all the configuration options for a specific
@@ -31,7 +30,7 @@ class PersistConfig c where
     createPoolConfig :: c -> IO (PersistConfigPool c)
 
     -- | Run a database action by taking a connection from the pool.
-    runPool :: (MonadBaseControl IO m, MonadIO m)
+    runPool :: MonadUnliftIO m
             => c
             -> PersistConfigBackend c m a
             -> PersistConfigPool c
@@ -48,7 +47,7 @@ instance
 
     loadConfig (Object o) =
         case HashMap.lookup "left" o of
-            Just v -> Left <$> loadConfig v
+            Just v -> Left A.<$> loadConfig v
             Nothing ->
                 case HashMap.lookup "right" o of
                     Just v -> Right <$> loadConfig v

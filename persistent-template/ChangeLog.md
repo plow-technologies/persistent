@@ -1,3 +1,20 @@
+## 2.5.4
+
+* [persistent#778](https://github.com/yesodweb/persistent/issues/778): Add `persistManyFileWith`.
+
+## 2.5.3.1
+
+* Slight improvement to the error message when a Persistent field can't be parsed from database results
+
+## 2.5.3
+
+* Exposed `parseReferences` to allow custom QuasiQuoters
+
+## 2.5.2
+
+* Fix incorrect `ToJSON`/`FromJSON` instance generation for generic
+  backends
+
 ## 2.5.1.6
 
 Allow non-null self-references in a list

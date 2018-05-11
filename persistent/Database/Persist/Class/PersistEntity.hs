@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -32,13 +33,18 @@ import qualified Data.Text.Lazy.Builder as TB
 import Data.Aeson (ToJSON (..), FromJSON (..), fromJSON, object, (.:), (.=), Value (Object))
 import qualified Data.Aeson.Parser as AP
 import Data.Aeson.Types (Parser,Result(Error,Success))
+#if MIN_VERSION_aeson(1,0,0)
+import Data.Aeson.Text (encodeToTextBuilder)
+#else
 import Data.Aeson.Encode (encodeToTextBuilder)
+#endif
 import Data.Attoparsec.ByteString (parseOnly)
-import Control.Applicative ((<$>), (<*>))
+import Control.Applicative as A ((<$>), (<*>))
 import Data.Monoid (mappend)
 import qualified Data.HashMap.Strict as HM
 import Data.Typeable (Typeable)
 import Data.Maybe (isJust)
+import GHC.Generics
 
 -- | Persistent serialized Haskell records to the database.
 -- A Database 'Entity' (A row in SQL, a document in MongoDB, etc)
@@ -166,17 +172,16 @@ data Filter record = forall typ. PersistField typ => Filter
 -- your query returns two entities (i.e. @(Entity backend a,
 -- Entity backend b)@), then you must you use @SELECT ??, ??
 -- WHERE ...@, and so on.
-data Entity record = PersistEntity record =>
+data Entity record =
     Entity { entityKey :: Key record
            , entityVal :: record }
+    deriving Typeable
 
-deriving instance (PersistEntity record, Eq (Key record), Eq record) => Eq (Entity record)
-deriving instance (PersistEntity record, Ord (Key record), Ord record) => Ord (Entity record)
-deriving instance (PersistEntity record, Show (Key record), Show record) => Show (Entity record)
-deriving instance (PersistEntity record, Read (Key record), Read record) => Read (Entity record)
-#if MIN_VERSION_base(4,7,0)
-deriving instance Typeable Entity
-#endif
+deriving instance (Generic (Key record), Generic record) => Generic (Entity record)
+deriving instance (Eq (Key record), Eq record) => Eq (Entity record)
+deriving instance (Ord (Key record), Ord record) => Ord (Entity record)
+deriving instance (Show (Key record), Show record) => Show (Entity record)
+deriving instance (Read (Key record), Read record) => Read (Entity record)
 
 -- | Get list of values corresponding to given entity.
 entityValues :: PersistEntity record => Entity record -> [PersistValue]
@@ -218,8 +223,8 @@ keyValueEntityToJSON (Entity key value) = object
 keyValueEntityFromJSON :: (PersistEntity record, FromJSON record, FromJSON (Key record))
                        => Value -> Parser (Entity record)
 keyValueEntityFromJSON (Object o) = Entity
-    <$> o .: "key"
-    <*> o .: "value"
+    A.<$> o .: "key"
+    A.<*> o .: "value"
 keyValueEntityFromJSON _ = fail "keyValueEntityFromJSON: not an object"
 
 -- | Predefined @toJSON@. The resulting JSON looks like
@@ -256,7 +261,7 @@ instance (PersistEntity record, PersistField record, PersistField (Key record))
         _ -> error $ T.unpack $ errMsg "expected PersistMap"
 
     fromPersistValue (PersistMap alist) = case after of
-        [] -> Left $ errMsg $ "did not find " `mappend` idField `mappend` " field"
+        [] -> Left $ errMsg $ "did not find " `Data.Monoid.mappend` idField `mappend` " field"
         ("_id", kv):afterRest ->
             fromPersistValue (PersistMap (before ++ afterRest)) >>= \record ->
                 keyFromValues [kv] >>= \k ->

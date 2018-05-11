@@ -13,9 +13,8 @@ module Database.Persist.Sql.Migration
   ) where
 
 
-import Control.Monad.Trans.Control (MonadBaseControl)
 import Control.Monad.Trans.Class (MonadTrans (..))
-import Control.Monad.IO.Class
+import Control.Monad.IO.Unlift
 import Control.Monad.Trans.Writer
 import Control.Monad.Trans.Reader (ReaderT (..), ask)
 import Control.Monad (liftM, unless)
@@ -23,16 +22,18 @@ import Data.Text (Text, unpack, snoc, isPrefixOf, pack)
 import qualified Data.Text.IO
 import System.IO
 import System.IO.Silently (hSilence)
-import Control.Monad.Trans.Control (liftBaseOp_)
 import Database.Persist.Sql.Types
 import Database.Persist.Sql.Raw
 import Database.Persist.Types
+import Database.Persist.Sql.Orphan.PersistStore()
 
 allSql :: CautiousMigration -> [Sql]
 allSql = map snd
 safeSql :: CautiousMigration -> [Sql]
 safeSql = allSql . filter (not . fst)
 
+-- | Given a 'Migration', this parses it and returns either a list of
+-- errors associated with the migration or a list of migrations to do.
 parseMigration :: MonadIO m => Migration -> ReaderT SqlBackend m (Either [Text] CautiousMigration)
 parseMigration =
     liftIOReader . liftM go . runWriterT . execWriterT
@@ -42,7 +43,8 @@ parseMigration =
 
     liftIOReader (ReaderT m) = ReaderT $ liftIO . m
 
--- like parseMigration, but call error or return the CautiousMigration
+-- | Like 'parseMigration', but instead of returning the value in an
+-- 'Either' value, it calls 'error' on the error values.
 parseMigration' :: MonadIO m => Migration -> ReaderT SqlBackend m (CautiousMigration)
 parseMigration' m = do
   x <- parseMigration m
@@ -50,18 +52,25 @@ parseMigration' m = do
       Left errs -> error $ unlines $ map unpack errs
       Right sql -> return sql
 
+-- | Prints a migration.
 printMigration :: MonadIO m => Migration -> ReaderT SqlBackend m ()
 printMigration m = showMigration m
                >>= mapM_ (liftIO . Data.Text.IO.putStrLn)
 
+-- | Convert a 'Migration' to a list of 'Text' values corresponding to their
+-- 'Sql' statements.
 showMigration :: MonadIO m => Migration -> ReaderT SqlBackend m [Text]
 showMigration m = map (flip snoc ';') `liftM` getMigration m
 
+-- | Return all of the 'Sql' values associated with the given migration.
+-- Calls 'error' if there's a parse error on any migration.
 getMigration :: MonadIO m => Migration -> ReaderT SqlBackend m [Sql]
 getMigration m = do
   mig <- parseMigration' m
   return $ allSql mig
 
+-- | Runs a migration. If the migration fails to parse or if any of the
+-- migrations are unsafe, then this calls 'error' to halt the program.
 runMigration :: MonadIO m
              => Migration
              -> ReaderT SqlBackend m ()
@@ -69,11 +78,15 @@ runMigration m = runMigration' m False >> return ()
 
 -- | Same as 'runMigration', but returns a list of the SQL commands executed
 -- instead of printing them to stderr.
-runMigrationSilent :: (MonadBaseControl IO m, MonadIO m)
+runMigrationSilent :: (MonadUnliftIO m, MonadIO m)
                    => Migration
                    -> ReaderT SqlBackend m [Text]
-runMigrationSilent m = liftBaseOp_ (hSilence [stderr]) $ runMigration' m True
+runMigrationSilent m = withRunInIO $ \run ->
+  hSilence [stderr] $ run $ runMigration' m True
 
+-- | Run the given migration against the database. If the migration fails
+-- to parse, or there are any unsafe migrations, then this will error at
+-- runtime. This returns a list of the migrations that were executed.
 runMigration'
     :: MonadIO m
     => Migration
@@ -93,6 +106,8 @@ runMigration' m silent = do
     displayMigration (True,  s) = "*** " ++ unpack s ++ ";"
     displayMigration (False, s) = "    " ++ unpack s ++ ";"
 
+-- | Like 'runMigration', but this will perform the unsafe database
+-- migrations instead of erroring out.
 runMigrationUnsafe :: MonadIO m
                    => Migration
                    -> ReaderT SqlBackend m ()
@@ -116,6 +131,9 @@ sortMigrations x =
     -- choose to have this special sorting applied.
     isCreate t = pack "CREATe " `isPrefixOf` t
 
+-- |  Given a list of old entity definitions and a new 'EntityDef' in
+-- @val@, this creates a 'Migration' to update the old list of definitions
+-- with the new one.
 migrate :: [EntityDef]
         -> EntityDef
         -> Migration

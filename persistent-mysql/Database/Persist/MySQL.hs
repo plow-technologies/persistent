@@ -1,4 +1,8 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -14,20 +18,35 @@ module Database.Persist.MySQL
     , MySQLBase.defaultSSLInfo
     , MySQLConf(..)
     , mockMigration
+     -- * @ON DUPLICATE KEY UPDATE@ Functionality
+    , insertOnDuplicateKeyUpdate
+    , insertManyOnDuplicateKeyUpdate
+#if MIN_VERSION_base(4,7,0)
+    , HandleUpdateCollision
+    , pattern SomeField
+#elif MIN_VERSION_base(4,9,0)
+    , HandleUpdateCollision(SomeField)
+#endif
+    , SomeField
+    , copyField
+    , copyUnlessNull
+    , copyUnlessEmpty
+    , copyUnlessEq
     ) where
 
 import Control.Arrow
 import Control.Monad.Logger (MonadLogger, runNoLoggingT)
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Error (ErrorT(..))
-import Control.Monad.Trans.Reader (runReaderT)
+import Control.Monad.Trans.Except (runExceptT)
+import Control.Monad.Trans.Reader (runReaderT, ReaderT)
 import Control.Monad.Trans.Writer (runWriterT)
+import Data.Either (partitionEithers)
 import Data.Monoid ((<>))
+import qualified Data.Monoid as Monoid
 import Data.Aeson
 import Data.Aeson.Types (modifyFailure)
 import Data.ByteString (ByteString)
-import Data.Either (partitionEithers)
 import Data.Fixed (Pico)
 import Data.Function (on)
 import Data.IORef
@@ -49,6 +68,7 @@ import qualified Data.Text.Encoding as T
 
 import Database.Persist.Sql
 import Database.Persist.Sql.Types.Internal (mkPersistBackend)
+import Database.Persist.Sql.Util (commaSeparated, mkUpdateText', parenWrapped)
 import Data.Int (Int64)
 
 import qualified Database.MySQL.Simple        as MySQL
@@ -58,14 +78,15 @@ import qualified Database.MySQL.Simple.Types  as MySQL
 
 import qualified Database.MySQL.Base          as MySQLBase
 import qualified Database.MySQL.Base.Types    as MySQLBase
-import Control.Monad.Trans.Control (MonadBaseControl)
-import Control.Monad.Trans.Resource (runResourceT)
+import Control.Monad.IO.Unlift (MonadUnliftIO)
+
+import Prelude
 
 -- | Create a MySQL connection pool and run the given action.
 -- The pool is properly released after the action finishes using
 -- it.  Note that you should not use the given 'ConnectionPool'
 -- outside the action since it may be already been released.
-withMySQLPool :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, IsSqlBackend backend)
+withMySQLPool :: (MonadLogger m, MonadUnliftIO m, IsSqlBackend backend)
               => MySQL.ConnectInfo
               -- ^ Connection information.
               -> Int
@@ -79,7 +100,7 @@ withMySQLPool ci = withSqlPool $ open' ci
 -- | Create a MySQL connection pool.  Note that it's your
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withMySQLPool' for automatic resource control.
-createMySQLPool :: (MonadBaseControl IO m, MonadIO m, MonadLogger m, IsSqlBackend backend)
+createMySQLPool :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
                 => MySQL.ConnectInfo
                 -- ^ Connection information.
                 -> Int
@@ -90,7 +111,7 @@ createMySQLPool ci = createSqlPool $ open' ci
 
 -- | Same as 'withMySQLPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withMySQLConn :: (MonadBaseControl IO m, MonadIO m, MonadLogger m, IsSqlBackend backend)
+withMySQLConn :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
               => MySQL.ConnectInfo
               -- ^ Connection information.
               -> (backend -> m a)
@@ -112,6 +133,7 @@ open' ci logFunc = do
         , connInsertSql  = insertSql'
         , connInsertManySql = Nothing
         , connUpsertSql = Nothing
+        , connPutManySql = Just putManySql
         , connClose      = MySQL.close conn
         , connMigrateSql = migrate' ci
         , connBegin      = const $ MySQL.execute_ conn "start transaction" >> return ()
@@ -124,6 +146,7 @@ open' ci logFunc = do
         , connRDBMS      = "mysql"
         , connLimitOffset = decorateSQLWithLimitOffset "LIMIT 18446744073709551615"
         , connLogFunc    = logFunc
+        , connMaxParams = Nothing
         }
 
 -- | Prepare a query.  We don't support prepared statements, but
@@ -166,7 +189,7 @@ withStmt' :: MonadIO m
           => MySQL.Connection
           -> MySQL.Query
           -> [PersistValue]
-          -> Acquire (Source m [PersistValue])
+          -> Acquire (ConduitM () [PersistValue] m ())
 withStmt' conn query vals = do
     result <- mkAcquire createResult MySQLBase.freeResult
     return $ fetchRows result >>= CL.sourceList
@@ -233,7 +256,7 @@ convertPV f = (f .) . MySQL.convert
 -- | Get the corresponding @'Getter' 'PersistValue'@ depending on
 -- the type of the column.
 getGetter :: MySQLBase.Field -> Getter PersistValue
-getGetter field = go (MySQLBase.fieldType field) 
+getGetter field = go (MySQLBase.fieldType field)
                         (MySQLBase.fieldLength field)
                             (MySQLBase.fieldCharSet field)
   where
@@ -264,7 +287,7 @@ getGetter field = go (MySQLBase.fieldType field)
     go MySQLBase.VarChar    _ _  = convertPV PersistText
     go MySQLBase.VarString  _ _  = convertPV PersistText
     go MySQLBase.String     _ _  = convertPV PersistText
-    
+
     go MySQLBase.Blob       _ 63 = convertPV PersistByteString
     go MySQLBase.TinyBlob   _ 63 = convertPV PersistByteString
     go MySQLBase.MediumBlob _ 63 = convertPV PersistByteString
@@ -323,10 +346,10 @@ migrate' connectInfo allDefs getter val = do
         let foreigns = do
               Column { cName=cname, cReference=Just (refTblName, _a) } <- newcols
               return $ AlterColumn name (refTblName, addReference allDefs (refName name cname) refTblName cname)
-                 
-        let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef)) 
+
+        let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef))
                                         in AlterColumn name (foreignRefTableDBName fdef, AddReference (foreignRefTableDBName fdef) (foreignConstraintNameDBName fdef) childfields parentfields)) fdefs
-        
+
         return $ Right $ map showAlterDb $ (addTable newcols val): uniques ++ foreigns ++ foreignsAlt
       -- No errors and something found, migrate
       (_, _, ([], old')) -> do
@@ -453,41 +476,51 @@ getColumns :: MySQL.ConnectInfo
                  )
 getColumns connectInfo getter def = do
     -- Find out ID column.
-    stmtIdClmn <- getter "SELECT COLUMN_NAME, \
-                                 \IS_NULLABLE, \
-                                 \DATA_TYPE, \
-                                 \COLUMN_DEFAULT \
-                          \FROM INFORMATION_SCHEMA.COLUMNS \
-                          \WHERE TABLE_SCHEMA = ? \
-                            \AND TABLE_NAME   = ? \
-                            \AND COLUMN_NAME  = ?"
-    inter1 <- with (stmtQuery stmtIdClmn vals) ($$ CL.consume)
-    ids <- runResourceT $ CL.sourceList inter1 $$ helperClmns -- avoid nested queries
+    stmtIdClmn <- getter $ T.concat
+      [ "SELECT COLUMN_NAME, "
+      ,   "IS_NULLABLE, "
+      ,   "DATA_TYPE, "
+      ,   "COLUMN_DEFAULT "
+      , "FROM INFORMATION_SCHEMA.COLUMNS "
+      , "WHERE TABLE_SCHEMA = ? "
+      ,   "AND TABLE_NAME   = ? "
+      ,   "AND COLUMN_NAME  = ?"
+      ]
+    inter1 <- with (stmtQuery stmtIdClmn vals) (\src -> runConduit $ src .| CL.consume)
+    ids <- runConduitRes $ CL.sourceList inter1 .| helperClmns -- avoid nested queries
 
     -- Find out all columns.
-    stmtClmns <- getter "SELECT COLUMN_NAME, \
-                               \IS_NULLABLE, \
-                               \COLUMN_TYPE, \
-                               \COLUMN_DEFAULT \
-                        \FROM INFORMATION_SCHEMA.COLUMNS \
-                        \WHERE TABLE_SCHEMA = ? \
-                          \AND TABLE_NAME   = ? \
-                          \AND COLUMN_NAME <> ?"
-    inter2 <- with (stmtQuery stmtClmns vals) ($$ CL.consume)
-    cs <- runResourceT $ CL.sourceList inter2 $$ helperClmns -- avoid nested queries
+    stmtClmns <- getter $ T.concat
+      [ "SELECT COLUMN_NAME, "
+      ,   "IS_NULLABLE, "
+      ,   "DATA_TYPE, "
+      ,   "COLUMN_TYPE, "
+      ,   "CHARACTER_MAXIMUM_LENGTH, "
+      ,   "NUMERIC_PRECISION, "
+      ,   "NUMERIC_SCALE, "
+      ,   "COLUMN_DEFAULT "
+      , "FROM INFORMATION_SCHEMA.COLUMNS "
+      , "WHERE TABLE_SCHEMA = ? "
+      ,   "AND TABLE_NAME   = ? "
+      ,   "AND COLUMN_NAME <> ?"
+      ]
+    inter2 <- with (stmtQuery stmtClmns vals) (\src -> runConduitRes $ src .| CL.consume)
+    cs <- runConduitRes $ CL.sourceList inter2 .| helperClmns -- avoid nested queries
 
     -- Find out the constraints.
-    stmtCntrs <- getter "SELECT CONSTRAINT_NAME, \
-                               \COLUMN_NAME \
-                        \FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
-                        \WHERE TABLE_SCHEMA = ? \
-                          \AND TABLE_NAME   = ? \
-                          \AND COLUMN_NAME <> ? \
-                          \AND CONSTRAINT_NAME <> 'PRIMARY' \
-                          \AND REFERENCED_TABLE_SCHEMA IS NULL \
-                        \ORDER BY CONSTRAINT_NAME, \
-                                 \COLUMN_NAME"
-    us <- with (stmtQuery stmtCntrs vals) ($$ helperCntrs)
+    stmtCntrs <- getter $ T.concat
+      [ "SELECT CONSTRAINT_NAME, "
+      ,   "COLUMN_NAME "
+      , "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+      , "WHERE TABLE_SCHEMA = ? "
+      ,   "AND TABLE_NAME   = ? "
+      ,   "AND COLUMN_NAME <> ? "
+      ,   "AND CONSTRAINT_NAME <> 'PRIMARY' "
+      ,   "AND REFERENCED_TABLE_SCHEMA IS NULL "
+      , "ORDER BY CONSTRAINT_NAME, "
+      ,   "COLUMN_NAME"
+      ]
+    us <- with (stmtQuery stmtCntrs vals) (\src -> runConduitRes $ src .| helperCntrs)
 
     -- Return both
     return (ids, cs ++ us)
@@ -496,7 +529,7 @@ getColumns connectInfo getter def = do
            , PersistText $ unDBName $ entityDB def
            , PersistText $ unDBName $ fieldDB $ entityId def ]
 
-    helperClmns = CL.mapM getIt =$ CL.consume
+    helperClmns = CL.mapM getIt .| CL.consume
         where
           getIt = fmap (either Left (Right . Left)) .
                   liftIO .
@@ -519,10 +552,14 @@ getColumn :: MySQL.ConnectInfo
           -> IO (Either Text Column)
 getColumn connectInfo getter tname [ PersistText cname
                                    , PersistText null_
-                                   , PersistText type'
+                                   , PersistText dataType
+                                   , PersistText colType
+                                   , colMaxLen
+                                   , colPrecision
+                                   , colScale
                                    , default'] =
     fmap (either (Left . pack) Right) $
-    runErrorT $ do
+    runExceptT $ do
       -- Default value
       default_ <- case default' of
                     PersistNull   -> return Nothing
@@ -536,84 +573,88 @@ getColumn connectInfo getter tname [ PersistText cname
                     _ -> fail $ "Invalid default column: " ++ show default'
 
       -- Foreign key (if any)
-      stmt <- lift $ getter "SELECT REFERENCED_TABLE_NAME, \
-                                   \CONSTRAINT_NAME, \
-                                   \ORDINAL_POSITION \
-                            \FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
-                            \WHERE TABLE_SCHEMA = ? \
-                              \AND TABLE_NAME   = ? \
-                              \AND COLUMN_NAME  = ? \
-                              \AND REFERENCED_TABLE_SCHEMA = ? \
-                            \ORDER BY CONSTRAINT_NAME, \
-                                     \COLUMN_NAME"
+      stmt <- lift . getter $ T.concat 
+        [ "SELECT REFERENCED_TABLE_NAME, "
+        ,   "CONSTRAINT_NAME, "
+        ,   "ORDINAL_POSITION "
+        , "FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+        , "WHERE TABLE_SCHEMA = ? "
+        ,   "AND TABLE_NAME   = ? "
+        ,   "AND COLUMN_NAME  = ? "
+        ,   "AND REFERENCED_TABLE_SCHEMA = ? "
+        , "ORDER BY CONSTRAINT_NAME, "
+        ,   "COLUMN_NAME"
+        ]
       let vars = [ PersistText $ pack $ MySQL.connectDatabase connectInfo
                  , PersistText $ unDBName $ tname
                  , PersistText cname
                  , PersistText $ pack $ MySQL.connectDatabase connectInfo ]
-      cntrs <- with (stmtQuery stmt vars) ($$ CL.consume)
+      cntrs <- liftIO $ with (stmtQuery stmt vars) (\src -> runConduit $ src .| CL.consume)
       ref <- case cntrs of
                [] -> return Nothing
                [[PersistText tab, PersistText ref, PersistInt64 pos]] ->
                    return $ if pos == 1 then Just (DBName tab, DBName ref) else Nothing
                _ -> fail "MySQL.getColumn/getRef: never here"
 
+      let colMaxLen' = case colMaxLen of
+            PersistInt64 l -> Just (fromIntegral l)
+            _ -> Nothing
+          ci = ColumnInfo
+            { ciColumnType = colType
+            , ciMaxLength = colMaxLen'
+            , ciNumericPrecision = colPrecision
+            , ciNumericScale = colScale
+            }
+      (typ, maxLen) <- parseColumnType dataType ci
       -- Okay!
       return Column
         { cName = DBName $ cname
         , cNull = null_ == "YES"
-        , cSqlType = parseType type'
+        , cSqlType = typ
         , cDefault = default_
         , cDefaultConstraintName = Nothing
-        , cMaxLen = Nothing -- FIXME: maxLen
+        , cMaxLen = maxLen
         , cReference = ref
         }
 
 getColumn _ _ _ x =
     return $ Left $ pack $ "Invalid result from INFORMATION_SCHEMA: " ++ show x
 
+-- | Extra column information from MySQL schema
+data ColumnInfo = ColumnInfo
+  { ciColumnType :: Text
+  , ciMaxLength :: Maybe Integer
+  , ciNumericPrecision :: PersistValue
+  , ciNumericScale :: PersistValue
+  }
 
 -- | Parse the type of column as returned by MySQL's
 -- @INFORMATION_SCHEMA@ tables.
-parseType :: Text -> SqlType
-parseType "bigint(20)" = SqlInt64
-parseType "decimal(32,20)" = SqlNumeric 32 20
-{-
-parseType "tinyint"    = SqlBool
+parseColumnType :: Monad m => Text -> ColumnInfo -> m (SqlType, Maybe Integer)
 -- Ints
-parseType "int"        = SqlInt32
---parseType "short"      = SqlInt32
---parseType "long"       = SqlInt64
---parseType "longlong"   = SqlInt64
---parseType "mediumint"  = SqlInt32
-parseType "bigint"     = SqlInt64
+parseColumnType "tinyint" ci | ciColumnType ci == "tinyint(1)" = return (SqlBool, Nothing)
+parseColumnType "int" ci | ciColumnType ci == "int(11)"        = return (SqlInt32, Nothing)
+parseColumnType "bigint" ci | ciColumnType ci == "bigint(20)"  = return (SqlInt64, Nothing)
 -- Double
---parseType "float"      = SqlReal
-parseType "double"     = SqlReal
---parseType "decimal"    = SqlReal
---parseType "newdecimal" = SqlReal
+parseColumnType x@("double") ci | ciColumnType ci == x         = return (SqlReal, Nothing)
+parseColumnType "decimal" ci                                   =
+  case (ciNumericPrecision ci, ciNumericScale ci) of
+    (PersistInt64 p, PersistInt64 s) ->
+      return (SqlNumeric (fromIntegral p) (fromIntegral s), Nothing)
+    _ ->
+      fail "missing DECIMAL precision in DB schema"
 -- Text
-parseType "varchar"    = SqlString
---parseType "varstring"  = SqlString
---parseType "string"     = SqlString
-parseType "text"       = SqlString
---parseType "tinytext"   = SqlString
---parseType "mediumtext" = SqlString
---parseType "longtext"   = SqlString
+parseColumnType "varchar" ci                                   = return (SqlString, ciMaxLength ci)
+parseColumnType "text" _                                       = return (SqlString, Nothing)
 -- ByteString
-parseType "varbinary"  = SqlBlob
-parseType "blob"       = SqlBlob
---parseType "tinyblob"   = SqlBlob
---parseType "mediumblob" = SqlBlob
---parseType "longblob"   = SqlBlob
+parseColumnType "varbinary" ci                                 = return (SqlBlob, ciMaxLength ci)
+parseColumnType "blob" _                                       = return (SqlBlob, Nothing)
 -- Time-related
-parseType "time"       = SqlTime
-parseType "datetime"   = SqlDayTime
---parseType "timestamp"  = SqlDayTime
-parseType "date"       = SqlDay
---parseType "newdate"    = SqlDay
---parseType "year"       = SqlDay
--}
-parseType b            = SqlOther b
+parseColumnType "time" _                                       = return (SqlTime, Nothing)
+parseColumnType "datetime" _                                   = return (SqlDayTime, Nothing)
+parseColumnType "date" _                                       = return (SqlDay, Nothing)
+
+parseColumnType _ ci                                           = return (SqlOther (ciColumnType ci), Nothing)
 
 
 ----------------------------------------------------------------------
@@ -680,10 +721,12 @@ findAlters tblName allDefs col@(Column name isNull type_ def _defConstraintName 
                 modType | showSqlType type_ maxLen False `ciEquals` showSqlType type_' maxLen' False && isNull == isNull' = []
                         | otherwise = [(name, Change col)]
                 -- Default value
+                -- Avoid DEFAULT NULL, since it is always unnecessary, and is an error for text/blob fields
                 modDef | def == def' = []
                        | otherwise   = case def of
                                          Nothing -> [(name, NoDefault)]
-                                         Just s -> [(name, Default $ T.unpack s)]
+                                         Just s -> if T.toUpper s == "NULL" then []
+                                                   else [(name, Default $ T.unpack s)]
             in ( refDrop ++ modType ++ modDef ++ refAdd
                , filter ((name /=) . cName) cols )
 
@@ -704,7 +747,9 @@ showColumn (Column n nu t def _defConstraintName maxLen ref) = concat
     , if nu then "NULL" else "NOT NULL"
     , case def of
         Nothing -> ""
-        Just s -> " DEFAULT " ++ T.unpack s
+        Just s -> -- Avoid DEFAULT NULL, since it is always unnecessary, and is an error for text/blob fields
+                  if T.toUpper s == "NULL" then ""
+                  else " DEFAULT " ++ T.unpack s
     , case ref of
         Nothing -> ""
         Just (s, _) -> " REFERENCES " ++ escapeDBName s
@@ -931,9 +976,9 @@ mockMigrate _connectInfo allDefs _getter val = do
     let name = entityDB val
     let (newcols, udefs, fdefs) = mkColumns allDefs val
     let udspair = map udToPair udefs
-    case ([], [], partitionEithers []) of
+    case () of
       -- Nothing found, create everything
-      ([], [], _) -> do
+      () -> do
         let uniques = flip concatMap udspair $ \(uname, ucols) ->
                       [ AlterTable name $
                         AddUniqueConstraint uname $
@@ -941,11 +986,12 @@ mockMigrate _connectInfo allDefs _getter val = do
         let foreigns = do
               Column { cName=cname, cReference=Just (refTblName, _a) } <- newcols
               return $ AlterColumn name (refTblName, addReference allDefs (refName name cname) refTblName cname)
-                 
-        let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef)) 
+
+        let foreignsAlt = map (\fdef -> let (childfields, parentfields) = unzip (map (\((_,b),(_,d)) -> (b,d)) (foreignFields fdef))
                                         in AlterColumn name (foreignRefTableDBName fdef, AddReference (foreignRefTableDBName fdef) (foreignConstraintNameDBName fdef) childfields parentfields)) fdefs
-        
+
         return $ Right $ map showAlterDb $ (addTable newcols val): uniques ++ foreigns ++ foreignsAlt
+    {- FIXME redundant, why is this here? The whole case expression is weird
       -- No errors and something found, migrate
       (_, _, ([], old')) -> do
         let excludeForeignKeys (xs,ys) = (map (\c -> case cReference c of
@@ -959,6 +1005,7 @@ mockMigrate _connectInfo allDefs _getter val = do
         return $ Right $ map showAlterDb $ acs' ++ ats'
       -- Errors
       (_, _, (errs, _)) -> return $ Left errs
+    -}
 
       where
         findTypeAndMaxLen tblName col = let (col', ty) = findTypeOfColumn allDefs tblName col
@@ -967,7 +1014,7 @@ mockMigrate _connectInfo allDefs _getter val = do
 
 
 -- | Mock a migration even when the database is not present.
--- This function will mock the migration for a database even when 
+-- This function will mock the migration for a database even when
 -- the actual database isn't already present in the system.
 mockMigration :: Migration -> IO ()
 mockMigration mig = do
@@ -991,7 +1038,270 @@ mockMigration mig = do
                              connNoLimit = undefined,
                              connRDBMS = undefined,
                              connLimitOffset = undefined,
-                             connLogFunc = undefined}
-      result = runReaderT . runWriterT . runWriterT $ mig 
+                             connLogFunc = undefined,
+                             connUpsertSql = undefined,
+                             connPutManySql = undefined,
+                             connMaxParams = Nothing}
+      result = runReaderT . runWriterT . runWriterT $ mig
   resp <- result sqlbackend
   mapM_ T.putStrLn $ map snd $ snd resp
+
+-- | MySQL specific 'upsert_'. This will prevent multiple queries, when one will
+-- do. The record will be inserted into the database. In the event that the
+-- record already exists in the database, the record will have the
+-- relevant updates performed.
+insertOnDuplicateKeyUpdate
+  :: ( backend ~ PersistEntityBackend record
+     , PersistEntity record
+     , MonadIO m
+     , PersistStore backend
+     , BackendCompatible SqlBackend backend
+     )
+  => record
+  -> [Update record]
+  -> ReaderT backend m ()
+insertOnDuplicateKeyUpdate record =
+  insertManyOnDuplicateKeyUpdate [record] []
+
+-- | This type is used to determine how to update rows using MySQL's
+-- @INSERT ... ON DUPLICATE KEY UPDATE@ functionality, exposed via
+-- 'insertManyOnDuplicateKeyUpdate' in this library.
+--
+-- @since 3.0.0
+data HandleUpdateCollision record where
+  -- | Copy the field directly from the record.
+  CopyField :: EntityField record typ -> HandleUpdateCollision record
+  -- | Only copy the field if it is not equal to the provided value.
+  CopyUnlessEq :: PersistField typ => EntityField record typ -> typ -> HandleUpdateCollision record
+
+-- | An alias for 'HandleUpdateCollision'. The type previously was only
+-- used to copy a single value, but was expanded to be handle more complex
+-- queries.
+--
+-- @since 2.6.2
+type SomeField = HandleUpdateCollision
+
+#if MIN_VERSION_base(4,8,0)
+pattern SomeField :: EntityField record typ -> SomeField record
+#endif
+pattern SomeField x = CopyField x
+{-# DEPRECATED SomeField "The type SomeField is deprecated. Use the type HandleUpdateCollision instead, and use the function copyField instead of the data constructor." #-}
+
+-- | Copy the field into the database only if the value in the
+-- corresponding record is non-@NULL@.
+--
+-- @since  2.6.2
+copyUnlessNull :: PersistField typ => EntityField record (Maybe typ) -> HandleUpdateCollision record
+copyUnlessNull field = CopyUnlessEq field Nothing
+
+-- | Copy the field into the database only if the value in the
+-- corresponding record is non-empty, where "empty" means the Monoid
+-- definition for 'mempty'. Useful for 'Text', 'String', 'ByteString', etc.
+--
+-- The resulting 'HandleUpdateCollision' type is useful for the
+-- 'insertManyOnDuplicateKeyUpdate' function.
+--
+-- @since  2.6.2
+copyUnlessEmpty :: (Monoid.Monoid typ, PersistField typ) => EntityField record typ -> HandleUpdateCollision record
+copyUnlessEmpty field = CopyUnlessEq field Monoid.mempty
+
+-- | Copy the field into the database only if the field is not equal to the
+-- provided value. This is useful to avoid copying weird nullary data into
+-- the database.
+--
+-- The resulting 'HandleUpdateCollision' type is useful for the
+-- 'insertManyOnDuplicateKeyUpdate' function.
+--
+-- @since  2.6.2
+copyUnlessEq :: PersistField typ => EntityField record typ -> typ -> HandleUpdateCollision record
+copyUnlessEq = CopyUnlessEq
+
+-- | Copy the field directly from the record.
+--
+-- @since 3.0
+copyField :: PersistField typ => EntityField record typ -> HandleUpdateCollision record
+copyField = CopyField
+
+-- | Do a bulk insert on the given records in the first parameter. In the event
+-- that a key conflicts with a record currently in the database, the second and
+-- third parameters determine what will happen.
+--
+-- The second parameter is a list of fields to copy from the original value.
+-- This allows you to specify which fields to copy from the record you're trying
+-- to insert into the database to the preexisting row.
+--
+-- The third parameter is a list of updates to perform that are independent of
+-- the value that is provided. You can use this to increment a counter value.
+-- These updates only occur if the original record is present in the database.
+--
+-- === __More details on 'HandleUpdateCollision' usage__
+--
+-- The @['HandleUpdateCollision']@ parameter allows you to specify which fields (and
+-- under which conditions) will be copied from the inserted rows. For
+-- a brief example, consider the following data model and existing data set:
+--
+-- @
+-- Item
+--   name        Text
+--   description Text
+--   price       Double Maybe
+--   quantity    Int Maybe
+--
+--   Primary name
+-- @
+--
+-- > items:
+-- > +------+-------------+-------+----------+
+-- > | name | description | price | quantity |
+-- > +------+-------------+-------+----------+
+-- > | foo  | very good   |       |    3     |
+-- > | bar  |             |  3.99 |          |
+-- > +------+-------------+-------+----------+
+--
+-- This record type has a single natural key on @itemName@. Let's suppose
+-- that we download a CSV of new items to store into the database. Here's
+-- our CSV:
+--
+-- > name,description,price,quantity
+-- > foo,,2.50,6
+-- > bar,even better,,5
+-- > yes,wow,,
+--
+-- We parse that into a list of Haskell records:
+--
+-- @
+-- records =
+--   [ Item { itemName = "foo", itemDescription = ""
+--          , itemPrice = Just 2.50, itemQuantity = Just 6
+--          }
+--   , Item "bar" "even better" Nothing (Just 5)
+--   , Item "yes" "wow" Nothing Nothing
+--   ]
+-- @
+--
+-- The new CSV data is partial. It only includes __updates__ from the
+-- upstream vendor. Our CSV library parses the missing description field as
+-- an empty string. We don't want to override the existing description. So
+-- we can use the 'copyUnlessEmpty' function to say: "Don't update when the
+-- value is empty."
+--
+-- Likewise, the new row for @bar@ includes a quantity, but no price. We do
+-- not want to overwrite the existing price in the database with a @NULL@
+-- value. So we can use 'copyUnlessNull' to only copy the existing values
+-- in.
+--
+-- The final code looks like this:
+-- @
+-- 'insertManyOnDuplicateKeyUpdate' records
+--   [ 'copyUnlessEmpty' ItemDescription
+--   , 'copyUnlessNull' ItemPrice
+--   , 'copyUnlessNull' ItemQuantity
+--   ]
+--   []
+-- @
+--
+-- Once we run that code on the datahase, the new data set looks like this:
+--
+-- > items:
+-- > +------+-------------+-------+----------+
+-- > | name | description | price | quantity |
+-- > +------+-------------+-------+----------+
+-- > | foo  | very good   |  2.50 |    6     |
+-- > | bar  | even better |  3.99 |    5     |
+-- > | yes  | wow         |       |          |
+-- > +------+-------------+-------+----------+
+insertManyOnDuplicateKeyUpdate
+    :: forall record backend m.
+    ( backend ~ PersistEntityBackend record
+    , BackendCompatible SqlBackend backend
+    , PersistEntity record
+    , MonadIO m
+    )
+    => [record] -- ^ A list of the records you want to insert, or update
+    -> [HandleUpdateCollision record] -- ^ A list of the fields you want to copy over.
+    -> [Update record] -- ^ A list of the updates to apply that aren't dependent on the record being inserted.
+    -> ReaderT backend m ()
+insertManyOnDuplicateKeyUpdate [] _ _ = return ()
+insertManyOnDuplicateKeyUpdate records fieldValues updates =
+    uncurry rawExecute
+    $ mkBulkInsertQuery records fieldValues updates
+
+-- | This creates the query for 'bulkInsertOnDuplicateKeyUpdate'. If you
+-- provide an empty list of updates to perform, then it will generate
+-- a dummy/no-op update using the first field of the record. This avoids
+-- duplicate key exceptions.
+mkBulkInsertQuery
+    :: PersistEntity record
+    => [record] -- ^ A list of the records you want to insert, or update
+    -> [HandleUpdateCollision record] -- ^ A list of the fields you want to copy over.
+    -> [Update record] -- ^ A list of the updates to apply that aren't dependent on the record being inserted.
+    -> (Text, [PersistValue])
+mkBulkInsertQuery records fieldValues updates =
+    (q, recordValues <> updsValues <> copyUnlessValues)
+  where
+    mfieldDef x = case x of
+        CopyField rec -> Right (fieldDbToText (persistFieldDef rec))
+        CopyUnlessEq rec val -> Left (fieldDbToText (persistFieldDef rec), toPersistValue val)
+    (fieldsToMaybeCopy, updateFieldNames) = partitionEithers $ map mfieldDef fieldValues
+    fieldDbToText = T.pack . escapeDBName . fieldDB
+    entityDef' = entityDef records
+    firstField = case entityFieldNames of
+        [] -> error "The entity you're trying to insert does not have any fields."
+        (field:_) -> field
+    entityFieldNames = map fieldDbToText (entityFields entityDef')
+    tableName = T.pack . escapeDBName . entityDB $ entityDef'
+    copyUnlessValues = map snd fieldsToMaybeCopy
+    recordValues = concatMap (map toPersistValue . toPersistFields) records
+    recordPlaceholders = commaSeparated $ map (parenWrapped . commaSeparated . map (const "?") . toPersistFields) records
+    mkCondFieldSet n _ = T.concat
+        [ n
+        , "=COALESCE("
+        ,   "NULLIF("
+        ,     "VALUES(", n, "),"
+        ,     "?"
+        ,   "),"
+        ,   n
+        , ")"
+        ]
+    condFieldSets = map (uncurry mkCondFieldSet) fieldsToMaybeCopy
+    fieldSets = map (\n -> T.concat [n, "=VALUES(", n, ")"]) updateFieldNames
+    upds = map (mkUpdateText' (pack . escapeDBName) id) updates
+    updsValues = map (\(Update _ val _) -> toPersistValue val) updates
+    updateText = case fieldSets <> upds <> condFieldSets of
+        [] -> T.concat [firstField, "=", firstField]
+        xs -> commaSeparated xs
+    q = T.concat
+        [ "INSERT INTO "
+        , tableName
+        , " ("
+        , commaSeparated entityFieldNames
+        , ") "
+        , " VALUES "
+        , recordPlaceholders
+        , " ON DUPLICATE KEY UPDATE "
+        , updateText
+        ]
+
+putManySql :: EntityDef -> Int -> Text
+putManySql entityDef' numRecords
+  | numRecords > 0 = q
+  | otherwise = error "putManySql: numRecords MUST be greater than 0!"
+  where
+    tableName = T.pack . escapeDBName . entityDB $ entityDef'
+    fieldDbToText = T.pack . escapeDBName . fieldDB
+    entityFieldNames = map fieldDbToText (entityFields entityDef')
+    recordPlaceholders= parenWrapped . commaSeparated
+                      $ map (const "?") (entityFields entityDef')
+    mkAssignment n = T.concat [n, "=VALUES(", n, ")"]
+    fieldSets = map (mkAssignment . fieldDbToText) (entityFields entityDef')
+    q = T.concat
+        [ "INSERT INTO "
+        , tableName
+        , " ("
+        , commaSeparated entityFieldNames
+        , ") "
+        , " VALUES "
+        , commaSeparated (replicate numRecords recordPlaceholders)
+        , " ON DUPLICATE KEY UPDATE "
+        , commaSeparated fieldSets
+        ]
